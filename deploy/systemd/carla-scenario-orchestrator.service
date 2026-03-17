@@ -1,0 +1,19 @@
+[Unit]
+Description=CARLA Scenario Orchestrator
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/carla-scenario-orchestrator
+Environment=PYTHONUNBUFFERED=1
+Environment=ORCH_GPU_DEVICES=1,2,3,4,5,6,7
+ExecStart=/home/ubuntu/carla-scenario-orchestrator/.venv/bin/python -m uvicorn orchestrator.app:app --host 0.0.0.0 --port 18421
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

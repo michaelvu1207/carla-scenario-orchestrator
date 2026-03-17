@@ -29,8 +29,16 @@ def main() -> None:
     def handle_signal(signum, frame):  # type: ignore[no-untyped-def]
         stop_event.set()
 
+    def handle_pause(signum, frame):  # type: ignore[no-untyped-def]
+        pause_event.set()
+
+    def handle_resume(signum, frame):  # type: ignore[no-untyped-def]
+        pause_event.clear()
+
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGUSR1, handle_pause)
+    signal.signal(signal.SIGUSR2, handle_resume)
 
     _simulation_worker(
         request.model_dump(),
@@ -43,4 +51,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

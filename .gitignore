@@ -4,4 +4,7 @@ __pycache__/
 *.pyc
 runs/
 visualizations/
-
+monitor/.env
+monitor/.svelte-kit/
+monitor/build/
+monitor/node_modules/
