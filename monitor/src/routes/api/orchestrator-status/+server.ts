@@ -28,9 +28,10 @@ export async function GET() {
     ]);
 
     const latestJob = jobs && jobs.items.length > 0 ? jobs.items[jobs.items.length - 1] : null;
+    const isHealthy = Boolean(health && ('ok' in health ? health.ok : health.status === 'healthy'));
 
     return json({
-      healthy: health?.status === 'healthy',
+      healthy: isHealthy,
       health,
       simulation,
       capacity,
