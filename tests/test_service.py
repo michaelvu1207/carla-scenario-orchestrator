@@ -23,6 +23,10 @@ class FakeRuntimeBackend:
     def __init__(self) -> None:
         self.started_specs: list[RuntimeLaunchSpec] = []
         self.paused_jobs: set[str] = set()
+        self.initialize_calls = 0
+
+    def initialize_pool(self, scheduler) -> None:
+        self.initialize_calls += 1
 
     def run_job(self, spec, on_event, cancel_event):
         self.started_specs.append(spec)
@@ -151,6 +155,7 @@ class ServiceTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job.state, JobState.succeeded)
         self.assertEqual(job.gpu.device_id if job.gpu else None, "0")
+        self.assertEqual(job.container_name, "carla-orch-slot-0")
         self.assertEqual(len(job.events), 2)
         self.assertTrue(job.artifacts.recording_path.endswith("recording.mp4"))
         self.assertEqual(len(job.artifacts.uploaded_artifacts), 1)
@@ -222,6 +227,14 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(resumed["is_paused"])
         self.assertEqual(resumed["status"], "running")
         blocker.set()
+
+    def test_startup_initializes_runtime_pool_once(self) -> None:
+        runtime_backend = FakeRuntimeBackend()
+        base = self.make_service()
+        service = OrchestratorService(settings=base.settings, runtime_backend=runtime_backend)
+        service.startup()
+        service.startup()
+        self.assertEqual(runtime_backend.initialize_calls, 1)
 
 
 if __name__ == "__main__":

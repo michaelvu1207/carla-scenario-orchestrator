@@ -21,6 +21,7 @@ class JobState(str, Enum):
 class GpuLeaseInfo(BaseModel):
     slot_index: int
     device_id: str
+    container_name: str
     carla_rpc_port: int
     traffic_manager_port: int
 
@@ -28,8 +29,11 @@ class GpuLeaseInfo(BaseModel):
 class CapacitySlot(BaseModel):
     slot_index: int
     device_id: str
+    container_name: str
     busy: bool = False
     job_id: str | None = None
+    status: str = "ready"
+    status_error: str | None = None
     carla_rpc_port: int
     traffic_manager_port: int
 
@@ -38,6 +42,8 @@ class CapacityResponse(BaseModel):
     total_slots: int
     busy_slots: int
     free_slots: int
+    ready_slots: int
+    unavailable_slots: int
     slots: list[CapacitySlot] = Field(default_factory=list)
 
 

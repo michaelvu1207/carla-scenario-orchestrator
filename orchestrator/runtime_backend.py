@@ -14,9 +14,12 @@ from typing import Callable, Protocol
 from .config import Settings
 from .models import JobState, RuntimeExecutionResult, RuntimeLaunchSpec
 from .carla_runner.models import SimulationStreamMessage
+from .scheduler import GpuLease, GpuScheduler
 
 
 class RuntimeBackend(Protocol):
+    def initialize_pool(self, scheduler: GpuScheduler) -> None: ...
+
     def run_job(
         self,
         spec: RuntimeLaunchSpec,
@@ -38,19 +41,24 @@ class DockerRuntimeBackend:
         self._worker_processes: dict[str, subprocess.Popen[str]] = {}
         self._paused_jobs: set[str] = set()
 
+    def initialize_pool(self, scheduler: GpuScheduler) -> None:
+        for slot in scheduler.slots():
+            scheduler.mark_slot_warming(slot.slot_index)
+            try:
+                self._ensure_slot_container(slot)
+            except Exception as exc:
+                scheduler.mark_slot_unhealthy(slot.slot_index, str(exc))
+            else:
+                scheduler.mark_slot_ready(slot.slot_index)
+
     def run_job(
         self,
         spec: RuntimeLaunchSpec,
         on_event: Callable[[SimulationStreamMessage], None],
         cancel_event: Event,
     ) -> RuntimeExecutionResult:
-        container_name = f"{self.settings.carla_container_prefix}-{spec.job_id}".lower()
-        self._start_carla_container(spec, container_name)
-        try:
-            self._wait_for_tcp("127.0.0.1", spec.gpu.carla_rpc_port, cancel_event)
-            return self._run_worker(spec, on_event, cancel_event, container_name)
-        finally:
-            self._stop_carla_container(container_name)
+        self._ensure_slot_container(spec.gpu, cancel_event)
+        return self._run_worker(spec, on_event, cancel_event)
 
     def _docker_env_args(self) -> list[str]:
         return [
@@ -62,19 +70,38 @@ class DockerRuntimeBackend:
             "/usr/share/vulkan/icd.d/nvidia_icd.json:/usr/share/vulkan/icd.d/nvidia_icd.json:ro",
         ]
 
-    def _start_carla_container(self, spec: RuntimeLaunchSpec, container_name: str) -> None:
-        rpc_port = spec.gpu.carla_rpc_port
+    def _ensure_slot_container(self, slot: GpuLease | object, cancel_event: Event | None = None) -> None:
+        container_name = getattr(slot, "container_name")
+        if not self._is_container_running(container_name):
+            self._remove_container(container_name)
+            self._start_carla_container(slot)
+        self._wait_for_tcp("127.0.0.1", getattr(slot, "carla_rpc_port"), cancel_event)
+
+    def _is_container_running(self, container_name: str) -> bool:
+        result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Running}}", container_name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+    def _start_carla_container(self, slot: GpuLease | object) -> None:
+        rpc_port = getattr(slot, "carla_rpc_port")
+        container_name = getattr(slot, "container_name")
+        device_id = getattr(slot, "device_id")
         command = self.settings.carla_start_command_template.format(rpc_port=rpc_port)
         cmd = [
             "docker",
             "run",
             "-d",
-            "--rm",
+            "--restart",
+            "unless-stopped",
             "--name",
             container_name,
             "--privileged",
             "--gpus",
-            f"device={spec.gpu.device_id}",
+            f"device={device_id}",
             "--network",
             self.settings.docker_network_mode,
             *self._docker_env_args(),
@@ -85,7 +112,7 @@ class DockerRuntimeBackend:
         ]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
 
-    def _stop_carla_container(self, container_name: str) -> None:
+    def _remove_container(self, container_name: str) -> None:
         subprocess.run(
             ["docker", "rm", "-f", container_name],
             check=False,
@@ -93,11 +120,11 @@ class DockerRuntimeBackend:
             text=True,
         )
 
-    def _wait_for_tcp(self, host: str, port: int, cancel_event: Event) -> None:
+    def _wait_for_tcp(self, host: str, port: int, cancel_event: Event | None) -> None:
         deadline = self.settings.carla_startup_timeout_seconds
         waited = 0.0
         while waited < deadline:
-            if cancel_event.is_set():
+            if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("Job cancelled while waiting for CARLA to start.")
             try:
                 with socket.create_connection((host, port), timeout=1.0):
@@ -105,7 +132,10 @@ class DockerRuntimeBackend:
             except OSError:
                 pass
             waited += 1.0
-            cancel_event.wait(1.0)
+            if cancel_event is None:
+                threading.Event().wait(1.0)
+            else:
+                cancel_event.wait(1.0)
         raise RuntimeError(f"Timed out waiting for CARLA to accept connections on {host}:{port}.")
 
     def _run_worker(
@@ -113,7 +143,6 @@ class DockerRuntimeBackend:
         spec: RuntimeLaunchSpec,
         on_event: Callable[[SimulationStreamMessage], None],
         cancel_event: Event,
-        container_name: str,
     ) -> RuntimeExecutionResult:
         env = os.environ.copy()
         python_path = env.get("PYTHONPATH", "")
@@ -167,7 +196,7 @@ class DockerRuntimeBackend:
                 return RuntimeExecutionResult(
                     state=JobState.failed,
                     error=f"Runner exited with code {process.returncode}.",
-                    extra={"container_name": container_name},
+                    extra={"container_name": spec.gpu.container_name},
                 )
             return self._build_result(spec.output_dir)
         finally:

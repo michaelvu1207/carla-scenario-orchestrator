@@ -66,8 +66,20 @@ class OrchestratorService:
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
+        self._runtime_pool_ready = False
+
+    def startup(self) -> None:
+        self._ensure_runtime_pool_started()
+
+    def _ensure_runtime_pool_started(self) -> None:
+        with self._lock:
+            if self._runtime_pool_ready:
+                return
+            self.runtime_backend.initialize_pool(self.scheduler)
+            self._runtime_pool_ready = True
 
     def submit_job(self, request: SimulationRunRequest) -> JobSubmissionResponse:
+        self._ensure_runtime_pool_started()
         job_id = uuid.uuid4().hex[:12]
         job_dir = self.settings.jobs_root / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +140,7 @@ class OrchestratorService:
         capacity = self.scheduler.snapshot()
         status = self.carla_metadata.get_status()
         return HealthResponse(
-            status="healthy",
+            status="healthy" if capacity.unavailable_slots == 0 else "degraded",
             total_slots=capacity.total_slots,
             busy_slots=capacity.busy_slots,
             queued_jobs=self.store.queued_count(),
@@ -322,6 +334,7 @@ class OrchestratorService:
         )
 
     def _run_job(self, job_id: str) -> None:
+        self._ensure_runtime_pool_started()
         job = self.store.get(job_id)
         if job is None:
             return
@@ -340,7 +353,7 @@ class OrchestratorService:
         self.store.update(job_id, state=JobState.starting, gpu=lease.to_model(), queue_position=0)
 
         runtime_spec = self._write_runtime_files(job, lease.to_model())
-        self.store.update(job_id, container_name=f"{self.settings.carla_container_prefix}-{job_id}".lower())
+        self.store.update(job_id, container_name=lease.container_name)
 
         def on_event(payload: SimulationStreamMessage) -> None:
             self.store.append_event(job_id, payload)

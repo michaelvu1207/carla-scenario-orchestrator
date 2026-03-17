@@ -22,11 +22,18 @@ The runtime model is:
 
 - one FastAPI process receives jobs
 - one GPU slot is reserved per active job
-- one CARLA Docker container is launched per job
-- one scenario runner subprocess connects to that CARLA instance and executes the scenario
+- one persistent CARLA Docker container is kept warm per GPU slot
+- one scenario runner subprocess connects to the already-running slot container and executes the scenario
 - job events are captured and exposed over websocket streams
 - artifacts are written under `runs/<job_id>/`
 - artifacts can be uploaded to S3 for durable storage
+
+Container lifecycle:
+
+- the orchestrator warms the CARLA pool during app startup
+- slot containers are named `carla-orch-slot-<slot_index>`
+- containers are reused across jobs instead of being stopped and recreated
+- jobs only lease an available slot; finishing a job releases the slot but leaves the CARLA container running
 
 The repo layout is:
 
@@ -132,7 +139,7 @@ Current production ports:
 - orchestrator API: `18421`
 - CARLA metadata CARLA host/port: `127.0.0.1:2000`
 
-Per-job CARLA slot ports:
+Persistent CARLA slot ports:
 
 | Slot | GPU | CARLA RPC | Traffic Manager |
 | --- | --- | --- | --- |
@@ -155,7 +162,9 @@ ORCH_PORT_STRIDE=37
 Notes:
 
 - `ORCH_CARLA_METADATA_PORT=2000` still points at the always-on local CARLA instance used for metadata queries such as map status, blueprint listing, and runtime map inspection
-- per-job CARLA Docker instances do not use port `2000`; they use the uncommon port sequence above
+- job execution CARLA containers do not use port `2000`; they use the uncommon per-slot port sequence above
+- on startup the orchestrator ensures all seven slot containers are present and accepting connections before they are marked ready
+- if a slot container is missing when a job is assigned, the runtime backend recreates that slot container in place and keeps the stable slot name
 
 ## Systemd
 
@@ -220,6 +229,16 @@ Important variables:
 - `ORCH_STORAGE_BUCKET`
 - `ORCH_STORAGE_REGION`
 - `ORCH_STORAGE_PREFIX`
+
+The container prefix is used to derive stable slot container names. With the production defaults, the pool is:
+
+- `carla-orch-slot-0`
+- `carla-orch-slot-1`
+- `carla-orch-slot-2`
+- `carla-orch-slot-3`
+- `carla-orch-slot-4`
+- `carla-orch-slot-5`
+- `carla-orch-slot-6`
 
 Artifact upload layout:
 

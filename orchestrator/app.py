@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -20,7 +21,15 @@ from .carla_runner.models import (
 
 settings = Settings.load()
 service = OrchestratorService(settings)
-app = FastAPI(title="CARLA Scenario Orchestrator")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    service.startup()
+    yield
+
+
+app = FastAPI(title="CARLA Scenario Orchestrator", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
