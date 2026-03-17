@@ -18,12 +18,23 @@ from .models import (
     JobSubmissionResponse,
     RuntimeLaunchSpec,
 )
+from .carla_metadata import CarlaMetadataService
+from .llm import BedrockScenarioLLM, BedrockSceneAssistant
+from .llm.langchain_support import LANGCHAIN_AVAILABLE, LANGSMITH_AVAILABLE, langsmith_tracing_enabled
 from .runtime_backend import DockerRuntimeBackend, RuntimeBackend
 from .scheduler import GpuScheduler
 from .store import JobStore
 from .carla_runner.dataset_repository import list_supported_maps
-from .carla_runner.models import RecordingInfo, SimulationRunDiagnostics, SimulationRunRequest, SimulationStreamMessage
-from .utility_proxy import UtilityBackendProxy
+from .carla_runner.models import (
+    LLMGenerateRequest,
+    LLMGenerateResponse,
+    RecordingInfo,
+    SceneAssistantRequest,
+    SceneAssistantResponse,
+    SimulationRunDiagnostics,
+    SimulationRunRequest,
+    SimulationStreamMessage,
+)
 
 
 class OrchestratorService:
@@ -45,7 +56,13 @@ class OrchestratorService:
             self.artifact_storage = S3ArtifactStorage(settings)
         else:
             self.artifact_storage = NullArtifactStorage()
-        self.utility_proxy = UtilityBackendProxy(settings.utility_backend_base)
+        self.carla_metadata = CarlaMetadataService(
+            host=settings.carla_metadata_host,
+            port=settings.carla_metadata_port,
+            timeout=settings.carla_metadata_timeout,
+        )
+        self.llm = BedrockScenarioLLM()
+        self.scene_assistant = BedrockSceneAssistant(carla_metadata=self.carla_metadata)
         self._cancel_events: dict[str, threading.Event] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
@@ -109,35 +126,35 @@ class OrchestratorService:
 
     def health(self) -> HealthResponse:
         capacity = self.scheduler.snapshot()
-        carla_connected = False
-        langchain_available = False
-        langsmith_available = False
-        langsmith_tracing = False
-        if self.utility_proxy.configured():
-            try:
-                utility_health = self.utility_proxy.fetch_json("/api/health")
-                carla_connected = bool(utility_health.get("carla_connected"))
-                langchain_available = bool(utility_health.get("langchain_available"))
-                langsmith_available = bool(utility_health.get("langsmith_available"))
-                langsmith_tracing = bool(utility_health.get("langsmith_tracing"))
-            except Exception:
-                carla_connected = False
+        status = self.carla_metadata.get_status()
         return HealthResponse(
             total_slots=capacity.total_slots,
             busy_slots=capacity.busy_slots,
             queued_jobs=self.store.queued_count(),
-            carla_connected=carla_connected,
+            carla_connected=status.connected,
             running=capacity.busy_slots > 0,
-            langchain_available=langchain_available,
-            langsmith_available=langsmith_available,
-            langsmith_tracing=langsmith_tracing,
+            langchain_available=LANGCHAIN_AVAILABLE,
+            langsmith_available=LANGSMITH_AVAILABLE,
+            langsmith_tracing=langsmith_tracing_enabled(),
         )
 
-    def proxy_json(self, path: str, method: str = "GET", payload: dict | None = None):
-        return self.utility_proxy.fetch_json(path, method=method, payload=payload)
+    def carla_status(self):
+        return self.carla_metadata.get_status()
 
-    def proxy_bytes(self, path: str, method: str = "GET", payload: dict | None = None) -> bytes:
-        return self.utility_proxy.fetch_bytes(path, method=method, payload=payload)
+    def carla_load_map(self, map_name: str):
+        return self.carla_metadata.load_map(map_name)
+
+    def runtime_map(self):
+        return self.carla_metadata.get_runtime_map()
+
+    def actor_blueprints(self) -> dict[str, list[str]]:
+        return self.carla_metadata.list_blueprints()
+
+    def llm_generate(self, request: LLMGenerateRequest) -> LLMGenerateResponse:
+        return self.llm.generate(request)
+
+    def llm_scene_assistant_chat(self, request: SceneAssistantRequest) -> SceneAssistantResponse:
+        return self.scene_assistant.chat(request)
 
     def latest_job(self) -> JobRecord | None:
         return self.store.latest()

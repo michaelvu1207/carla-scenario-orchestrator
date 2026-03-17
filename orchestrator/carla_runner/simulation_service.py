@@ -93,6 +93,24 @@ def _make_client(host: str, port: int, timeout: float) -> Any:
     return client
 
 
+def _destroy_carla_handles(client: Any, handles: list[Any], debug_log: Path) -> None:
+    alive_ids: list[int] = []
+    for handle in handles:
+        try:
+            if handle and getattr(handle, "is_alive", False):
+                alive_ids.append(int(handle.id))
+        except Exception:
+            continue
+    if not alive_ids:
+        return
+    try:
+        carla = _require_carla()
+        client.apply_batch([carla.command.DestroyActor(actor_id) for actor_id in alive_ids])
+        _append_debug_log(debug_log, f"Destroyed CARLA handles: {', '.join(str(actor_id) for actor_id in alive_ids)}.")
+    except Exception as exc:  # noqa: BLE001
+        _append_debug_log(debug_log, f"Failed to destroy CARLA handles {alive_ids}: {exc}")
+
+
 def _build_waypoint_index(
     world: Any,
     distance: float = 5.0,
@@ -1489,37 +1507,48 @@ def _simulation_worker(
             },
         )
     finally:
-        if sensor and sensor.is_alive:
-            sensor.stop()
-            sensor.destroy()
-        for controller in walker_controllers:
-            try:
-                if controller.is_alive:
-                    controller.stop()
-                    controller.destroy()
-            except Exception:
-                pass
-        for _, actor in actors:
-            try:
-                if actor.is_alive:
-                    actor.destroy()
-            except Exception:
-                pass
-        if world and original_settings is not None:
-            try:
-                world.apply_settings(original_settings)
-            except Exception:
-                pass
-        if tm is not None:
-            try:
-                tm.set_synchronous_mode(False)
-            except Exception:
-                pass
+        _append_debug_log(debug_log, "Finalizing simulation run.")
+        client = None
         try:
             client = _make_client(settings["carla_host"], settings["carla_port"], settings["carla_timeout"])
-            client.stop_recorder()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            _append_debug_log(debug_log, f"Failed to reconnect CARLA client during finalization: {exc}")
+
+        if sensor and sensor.is_alive:
+            try:
+                _append_debug_log(debug_log, f"Stopping camera sensor actor_id={int(sensor.id)}.")
+                sensor.stop()
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Failed to stop camera sensor cleanly: {exc}")
+
+        if world and original_settings is not None:
+            try:
+                _append_debug_log(debug_log, "Restoring original CARLA world settings.")
+                world.apply_settings(original_settings)
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Failed to restore CARLA world settings: {exc}")
+
+        if tm is not None:
+            try:
+                _append_debug_log(debug_log, "Disabling Traffic Manager synchronous mode.")
+                tm.set_synchronous_mode(False)
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Failed to disable Traffic Manager synchronous mode: {exc}")
+
+        if client is not None:
+            try:
+                _append_debug_log(debug_log, "Stopping CARLA recorder.")
+                client.stop_recorder()
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Failed to stop CARLA recorder: {exc}")
+
+        if client is not None:
+            destroy_handles: list[Any] = []
+            if sensor is not None:
+                destroy_handles.append(sensor)
+            destroy_handles.extend(controller for controller in walker_controllers if controller is not None)
+            destroy_handles.extend(actor for _, actor in actors if actor is not None)
+            _destroy_carla_handles(client, destroy_handles, debug_log)
 
         recording = None
         if frames_dir.exists() and any(frames_dir.glob("*.png")):

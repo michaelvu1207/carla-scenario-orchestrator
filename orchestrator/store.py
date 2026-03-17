@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
+import logging
 import threading
+from pathlib import Path
 from datetime import datetime, timezone
 
 from .models import JobArtifacts, JobEvent, JobRecord, JobState
 from .carla_runner.models import SimulationRunRequest, SimulationStreamMessage
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -12,10 +17,47 @@ def utc_now() -> datetime:
 
 
 class JobStore:
-    def __init__(self) -> None:
+    def __init__(self, persist_path: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._jobs: dict[str, JobRecord] = {}
         self._queue_order: list[str] = []
+        self._persist_path = persist_path
+        if persist_path is not None:
+            self._load_persisted()
+
+    # ── persistence ──────────────────────────────────────────────────────
+
+    def _load_persisted(self) -> None:
+        """Load previously persisted jobs from disk on startup."""
+        if self._persist_path is None or not self._persist_path.is_dir():
+            return
+        loaded = 0
+        for job_file in sorted(self._persist_path.glob("*.json")):
+            try:
+                data = json.loads(job_file.read_text(encoding="utf-8"))
+                job = JobRecord.model_validate(data)
+                self._jobs[job.job_id] = job
+                self._queue_order.append(job.job_id)
+                loaded += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to load persisted job %s: %s", job_file.name, exc)
+        if loaded:
+            logger.info("Restored %d persisted jobs from %s", loaded, self._persist_path)
+
+    def _persist_job(self, job: JobRecord) -> None:
+        """Write a single job record to disk as JSON (no events to keep files small)."""
+        if self._persist_path is None:
+            return
+        try:
+            self._persist_path.mkdir(parents=True, exist_ok=True)
+            # Persist without events to keep files small and avoid serialization churn
+            data = job.model_dump(mode="json", exclude={"events"})
+            path = self._persist_path / f"{job.job_id}.json"
+            path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to persist job %s: %s", job.job_id, exc)
+
+    # ── public API (unchanged signatures) ────────────────────────────────
 
     def create(self, job_id: str, request: SimulationRunRequest, artifacts: JobArtifacts) -> JobRecord:
         with self._lock:
@@ -31,6 +73,7 @@ class JobStore:
                 artifacts=artifacts,
             )
             self._jobs[job_id] = job
+            self._persist_job(job)
             return job
 
     def get(self, job_id: str) -> JobRecord | None:
@@ -86,6 +129,7 @@ class JobStore:
             job = self._jobs[job_id]
             job = job.model_copy(update={**updates, "updated_at": utc_now()})
             self._jobs[job_id] = job
+            self._persist_job(job)
             return job.model_copy(deep=True)
 
     def append_event(self, job_id: str, payload: SimulationStreamMessage) -> JobRecord:

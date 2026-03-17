@@ -10,7 +10,12 @@ from fastapi.responses import FileResponse, Response
 from .config import Settings
 from .models import CancelJobResponse, CompatibilityRunResponse, JobListResponse, JobRecord, JobSubmissionResponse
 from .service import OrchestratorService
-from .carla_runner.models import SimulationRunRequest
+from .carla_runner.models import (
+    LLMGenerateRequest,
+    MapLoadRequest,
+    SceneAssistantRequest,
+    SimulationRunRequest,
+)
 
 
 settings = Settings.load()
@@ -33,17 +38,20 @@ async def health():
 
 @app.get("/api/carla/status")
 async def carla_status():
-    return service.proxy_json("/api/carla/status")
+    return service.carla_status()
 
 
 @app.get("/api/carla/maps")
 async def carla_maps():
-    return service.proxy_json("/api/carla/maps")
+    return service.carla_status()
 
 
 @app.post("/api/carla/map/load")
-async def carla_map_load(request: dict):
-    return service.proxy_json("/api/carla/map/load", method="POST", payload=request)
+async def carla_map_load(request: MapLoadRequest):
+    try:
+        return service.carla_load_map(request.map_name)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/capacity")
@@ -58,22 +66,36 @@ async def supported_maps():
 
 @app.get("/api/map/runtime")
 async def runtime_map():
-    return service.proxy_json("/api/map/runtime")
+    try:
+        return service.runtime_map()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/actors/blueprints")
 async def actor_blueprints():
-    return service.proxy_json("/api/actors/blueprints")
+    try:
+        return service.actor_blueprints()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/llm/generate")
-async def llm_generate(request: dict):
-    return service.proxy_json("/api/llm/generate", method="POST", payload=request)
+async def llm_generate(request: LLMGenerateRequest):
+    if not request.selected_roads:
+        raise HTTPException(status_code=400, detail="Select at least one road before generating actors.")
+    try:
+        return service.llm_generate(request)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/llm/scene-assistant")
-async def llm_scene_assistant(request: dict):
-    return service.proxy_json("/api/llm/scene-assistant", method="POST", payload=request)
+async def llm_scene_assistant(request: SceneAssistantRequest):
+    try:
+        return service.llm_scene_assistant_chat(request)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/jobs", response_model=JobListResponse)
@@ -153,12 +175,12 @@ async def compatibility_stop(job_id: str | None = Query(default=None)):
 
 @app.post("/api/simulation/pause")
 async def compatibility_pause():
-    return {"status": "unsupported", "running": True}
+    raise HTTPException(status_code=501, detail="Pause is not supported by the orchestrator.")
 
 
 @app.post("/api/simulation/resume")
 async def compatibility_resume():
-    return {"status": "unsupported", "running": True}
+    raise HTTPException(status_code=501, detail="Resume is not supported by the orchestrator.")
 
 
 @app.get("/api/simulation/recordings")
@@ -184,7 +206,10 @@ async def simulation_run_details(run_id: str):
 
 @app.get("/api/simulation/recordings/file")
 async def simulation_recording_file(path: str):
-    file_path = Path(path)
+    file_path = Path(path).resolve()
+    jobs_root = settings.jobs_root.resolve()
+    if not file_path.is_relative_to(jobs_root):
+        raise HTTPException(status_code=403, detail="Access denied: path is outside the jobs directory.")
     if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Recording not found.")
     return FileResponse(file_path)

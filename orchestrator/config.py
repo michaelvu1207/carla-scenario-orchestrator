@@ -31,7 +31,9 @@ class Settings:
     python_executable: str
     docker_network_mode: str
     carla_start_command_template: str
-    utility_backend_base: str | None
+    carla_metadata_host: str
+    carla_metadata_port: int
+    carla_metadata_timeout: float
     storage_bucket: str | None
     storage_region: str
     storage_prefix: str
@@ -62,7 +64,9 @@ class Settings:
                 "ORCH_CARLA_START_COMMAND",
                 "./CarlaUE4.sh -RenderOffScreen -nosound -carla-rpc-port={rpc_port}",
             ),
-            utility_backend_base=(os.environ.get("ORCH_UTILITY_BACKEND_BASE") or "").strip() or None,
+            carla_metadata_host=os.environ.get("ORCH_CARLA_METADATA_HOST", "127.0.0.1"),
+            carla_metadata_port=int(os.environ.get("ORCH_CARLA_METADATA_PORT", "2000")),
+            carla_metadata_timeout=float(os.environ.get("ORCH_CARLA_METADATA_TIMEOUT", "20")),
             storage_bucket=(os.environ.get("ORCH_STORAGE_BUCKET") or "").strip() or None,
             storage_region=os.environ.get("ORCH_STORAGE_REGION")
             or os.environ.get("AWS_REGION")
