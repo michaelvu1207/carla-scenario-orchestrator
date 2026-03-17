@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 import select
+import signal
 import socket
 import subprocess
+import threading
 from pathlib import Path
 from threading import Event
 from typing import Callable, Protocol
@@ -22,10 +24,19 @@ class RuntimeBackend(Protocol):
         cancel_event: Event,
     ) -> RuntimeExecutionResult: ...
 
+    def pause_job(self, job_id: str) -> bool: ...
+
+    def resume_job(self, job_id: str) -> bool: ...
+
+    def is_job_paused(self, job_id: str) -> bool: ...
+
 
 class DockerRuntimeBackend:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._lock = threading.Lock()
+        self._worker_processes: dict[str, subprocess.Popen[str]] = {}
+        self._paused_jobs: set[str] = set()
 
     def run_job(
         self,
@@ -126,6 +137,8 @@ class DockerRuntimeBackend:
             text=True,
             bufsize=1,
         )
+        with self._lock:
+            self._worker_processes[spec.job_id] = process
         try:
             if process.stdout is None:
                 raise RuntimeError("Runner process stdout was not captured.")
@@ -158,9 +171,34 @@ class DockerRuntimeBackend:
                 )
             return self._build_result(spec.output_dir)
         finally:
+            with self._lock:
+                self._worker_processes.pop(spec.job_id, None)
+                self._paused_jobs.discard(spec.job_id)
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=2)
+
+    def pause_job(self, job_id: str) -> bool:
+        with self._lock:
+            process = self._worker_processes.get(job_id)
+            if process is None or process.poll() is not None:
+                return False
+            process.send_signal(signal.SIGUSR1)
+            self._paused_jobs.add(job_id)
+            return True
+
+    def resume_job(self, job_id: str) -> bool:
+        with self._lock:
+            process = self._worker_processes.get(job_id)
+            if process is None or process.poll() is not None:
+                return False
+            process.send_signal(signal.SIGUSR2)
+            self._paused_jobs.discard(job_id)
+            return True
+
+    def is_job_paused(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._paused_jobs
 
     def _handle_runner_line(self, line: str, on_event: Callable[[SimulationStreamMessage], None]) -> None:
         stripped = line.strip()

@@ -102,11 +102,14 @@ class CancelJobResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     ok: bool = True
+    status: str = "healthy"
     total_slots: int
     busy_slots: int
     queued_jobs: int
     carla_connected: bool = False
     running: bool = False
+    simulation_running: bool = False
+    connections: int = 0
     langchain_available: bool = False
     langsmith_available: bool = False
     langsmith_tracing: bool = False

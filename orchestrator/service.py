@@ -128,11 +128,14 @@ class OrchestratorService:
         capacity = self.scheduler.snapshot()
         status = self.carla_metadata.get_status()
         return HealthResponse(
+            status="healthy",
             total_slots=capacity.total_slots,
             busy_slots=capacity.busy_slots,
             queued_jobs=self.store.queued_count(),
             carla_connected=status.connected,
             running=capacity.busy_slots > 0,
+            simulation_running=capacity.busy_slots > 0,
+            connections=0,
             langchain_available=LANGCHAIN_AVAILABLE,
             langsmith_available=LANGSMITH_AVAILABLE,
             langsmith_tracing=langsmith_tracing_enabled(),
@@ -161,6 +164,90 @@ class OrchestratorService:
 
     def latest_running_job(self) -> JobRecord | None:
         return self.store.latest_running()
+
+    def simulation_status(self, job_id: str | None = None) -> dict[str, object]:
+        target = self.get_job(job_id) if job_id else None
+        if target is None:
+            target = self.latest_running_job() or self.latest_job()
+        if target is None:
+            return {
+                "status": "stopped",
+                "message": "No simulation is running",
+                "is_running": False,
+                "is_paused": False,
+                "job_id": None,
+                "queue_position": 0,
+            }
+
+        is_running = target.state in {JobState.starting, JobState.running}
+        is_paused = self.is_job_paused(target.job_id) if is_running else False
+
+        if target.state == JobState.queued:
+            status = "queued"
+            message = "Simulation job is queued"
+        elif is_running and is_paused:
+            status = "paused"
+            message = "Simulation is paused"
+        elif is_running:
+            status = "running"
+            message = "Simulation is running"
+        elif target.state == JobState.succeeded:
+            status = "succeeded"
+            message = "Latest simulation completed successfully"
+        elif target.state == JobState.failed:
+            status = "failed"
+            message = target.error or "Latest simulation failed"
+        elif target.state == JobState.cancelled:
+            status = "cancelled"
+            message = target.error or "Latest simulation was cancelled"
+        else:
+            status = "stopped"
+            message = "No simulation is running"
+
+        return {
+            "status": status,
+            "message": message,
+            "is_running": is_running,
+            "is_paused": is_paused,
+            "job_id": target.job_id,
+            "queue_position": target.queue_position,
+            "run_id": target.run_id,
+            "camera_recordings": bool(target.artifacts.recording_path),
+        }
+
+    def pause_job(self, job_id: str | None = None) -> dict[str, object]:
+        target = self.get_job(job_id) if job_id else self.latest_running_job()
+        if target is None:
+            return self.simulation_status(job_id)
+        pause_job = getattr(self.runtime_backend, "pause_job", None)
+        if pause_job is None or not pause_job(target.job_id):
+            raise RuntimeError("Pause is not available for the active runtime.")
+        return self.simulation_status(target.job_id)
+
+    def resume_job(self, job_id: str | None = None) -> dict[str, object]:
+        target = self.get_job(job_id) if job_id else self.latest_running_job()
+        if target is None:
+            return self.simulation_status(job_id)
+        resume_job = getattr(self.runtime_backend, "resume_job", None)
+        if resume_job is None or not resume_job(target.job_id):
+            raise RuntimeError("Resume is not available for the active runtime.")
+        return self.simulation_status(target.job_id)
+
+    def is_job_paused(self, job_id: str) -> bool:
+        is_job_paused = getattr(self.runtime_backend, "is_job_paused", None)
+        if is_job_paused is None:
+            return False
+        return bool(is_job_paused(job_id))
+
+    def map_info(self) -> dict[str, object]:
+        runtime_map = self.runtime_map()
+        waypoints: list[dict[str, float]] = []
+        for segment in runtime_map.road_segments:
+            waypoints.extend(segment.centerline)
+        return {
+            "map_name": runtime_map.map_name,
+            "waypoints": waypoints,
+        }
 
     def list_recordings(self) -> list[RecordingInfo]:
         items: list[RecordingInfo] = []

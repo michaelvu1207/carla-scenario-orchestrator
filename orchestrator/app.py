@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 
 from .config import Settings
 from .models import CancelJobResponse, CompatibilityRunResponse, JobListResponse, JobRecord, JobSubmissionResponse
@@ -62,6 +62,14 @@ async def capacity():
 @app.get("/api/maps/supported")
 async def supported_maps():
     return {"maps": service.supported_maps()}
+
+
+@app.get("/api/map/info")
+async def map_info():
+    try:
+        return service.map_info()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/map/runtime")
@@ -173,14 +181,25 @@ async def compatibility_stop(job_id: str | None = Query(default=None)):
     return {"status": "stopping", "running": latest.state not in {"failed", "succeeded", "cancelled"}}
 
 
+@app.get("/api/simulation/status")
+async def compatibility_status(job_id: str | None = Query(default=None)):
+    return service.simulation_status(job_id)
+
+
 @app.post("/api/simulation/pause")
-async def compatibility_pause():
-    raise HTTPException(status_code=501, detail="Pause is not supported by the orchestrator.")
+async def compatibility_pause(job_id: str | None = Query(default=None)):
+    try:
+        return service.pause_job(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/simulation/resume")
-async def compatibility_resume():
-    raise HTTPException(status_code=501, detail="Resume is not supported by the orchestrator.")
+async def compatibility_resume(job_id: str | None = Query(default=None)):
+    try:
+        return service.resume_job(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/simulation/recordings")

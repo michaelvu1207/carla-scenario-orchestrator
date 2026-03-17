@@ -22,6 +22,7 @@ from orchestrator.carla_runner.models import (
 class FakeRuntimeBackend:
     def __init__(self) -> None:
         self.started_specs: list[RuntimeLaunchSpec] = []
+        self.paused_jobs: set[str] = set()
 
     def run_job(self, spec, on_event, cancel_event):
         self.started_specs.append(spec)
@@ -52,6 +53,17 @@ class FakeRuntimeBackend:
             manifest_path=str(Path(spec.output_dir) / "run" / "manifest.json"),
             recording_path=str(Path(spec.output_dir) / "run" / "recording.mp4"),
         )
+
+    def pause_job(self, job_id: str) -> bool:
+        self.paused_jobs.add(job_id)
+        return True
+
+    def resume_job(self, job_id: str) -> bool:
+        self.paused_jobs.discard(job_id)
+        return True
+
+    def is_job_paused(self, job_id: str) -> bool:
+        return job_id in self.paused_jobs
 
 
 class FakeArtifactStorage:
@@ -112,7 +124,9 @@ class ServiceTests(unittest.TestCase):
             python_executable="python3",
             docker_network_mode="host",
             carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
-            utility_backend_base=None,
+            carla_metadata_host="127.0.0.1",
+            carla_metadata_port=2000,
+            carla_metadata_timeout=20,
             storage_bucket="simcloud-assets-public-test",
             storage_region="us-east-1",
             storage_prefix="runs",
@@ -167,6 +181,47 @@ class ServiceTests(unittest.TestCase):
         queued_job = service.get_job(second.job_id)
         assert queued_job is not None
         self.assertEqual(queued_job.state, JobState.cancelled)
+
+    def test_simulation_status_and_pause_resume_use_runtime_backend(self) -> None:
+        blocker = threading.Event()
+
+        class PausableRuntimeBackend(FakeRuntimeBackend):
+            def run_job(self, spec, on_event, cancel_event):
+                self.started_specs.append(spec)
+                on_event(
+                    SimulationStreamMessage(
+                        frame=1,
+                        timestamp=time.time(),
+                        actors=[],
+                    )
+                )
+                blocker.wait(timeout=1)
+                return RuntimeExecutionResult(
+                    state=JobState.succeeded,
+                    run_id=f"run-{spec.job_id}",
+                    manifest_path=str(Path(spec.output_dir) / "run" / "manifest.json"),
+                    recording_path=str(Path(spec.output_dir) / "run" / "recording.mp4"),
+                )
+
+        base = self.make_service()
+        service = OrchestratorService(settings=base.settings, runtime_backend=PausableRuntimeBackend())
+        response = service.submit_job(sample_request())
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            status = service.simulation_status(response.job_id)
+            if status["is_running"]:
+                break
+            time.sleep(0.05)
+
+        paused = service.pause_job(response.job_id)
+        self.assertTrue(paused["is_paused"])
+        self.assertEqual(paused["status"], "paused")
+
+        resumed = service.resume_job(response.job_id)
+        self.assertFalse(resumed["is_paused"])
+        self.assertEqual(resumed["status"], "running")
+        blocker.set()
 
 
 if __name__ == "__main__":
