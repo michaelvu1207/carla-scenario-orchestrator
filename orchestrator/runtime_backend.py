@@ -141,6 +141,10 @@ class DockerRuntimeBackend:
                 ready, _, _ = select.select([process.stdout], [], [], 0.5)
                 if ready:
                     line = process.stdout.readline()
+                    if line == "":
+                        if process.poll() is not None:
+                            break
+                        continue
                     if line:
                         self._handle_runner_line(line, on_event)
                 exit_code = process.poll()
@@ -187,4 +191,3 @@ class DockerRuntimeBackend:
             scenario_log_path=data.get("scenario_log"),
             debug_log_path=data.get("debug_log"),
         )
-
