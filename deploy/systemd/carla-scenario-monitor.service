@@ -1,0 +1,23 @@
+[Unit]
+Description=CARLA Scenario Monitor
+After=network-online.target carla-scenario-orchestrator.service
+Wants=network-online.target carla-scenario-orchestrator.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/carla-scenario-orchestrator/monitor
+Environment=HOST=0.0.0.0
+Environment=PORT=3001
+Environment=SSH_HOST=127.0.0.1
+Environment=SSH_USER=ubuntu
+Environment=ORCHESTRATOR_URL=http://127.0.0.1:18421
+EnvironmentFile=-/etc/default/carla-scenario-monitor
+ExecStart=/usr/bin/node build
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

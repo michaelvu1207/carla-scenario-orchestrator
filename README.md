@@ -159,7 +159,10 @@ Notes:
 
 ## Systemd
 
-The production unit is checked in at [deploy/systemd/carla-scenario-orchestrator.service](/Users/maikyon/Documents/Programming/carla-scenario-orchestrator/deploy/systemd/carla-scenario-orchestrator.service).
+The production units are checked in at:
+
+- [deploy/systemd/carla-scenario-orchestrator.service](/Users/maikyon/Documents/Programming/carla-scenario-orchestrator/deploy/systemd/carla-scenario-orchestrator.service)
+- [deploy/systemd/carla-scenario-monitor.service](/Users/maikyon/Documents/Programming/carla-scenario-orchestrator/deploy/systemd/carla-scenario-monitor.service)
 
 It currently does the following:
 
@@ -176,6 +179,23 @@ sudo systemctl restart carla-scenario-orchestrator.service
 sudo journalctl -u carla-scenario-orchestrator.service -f
 curl http://127.0.0.1:18421/api/health
 curl http://127.0.0.1:18421/api/capacity
+```
+
+The monitor unit currently does the following:
+
+- runs the built Svelte monitor from `monitor/`
+- listens on port `3001`
+- pins `ORCHESTRATOR_URL=http://127.0.0.1:18421`
+- restarts automatically on failure
+- reads the SSH password from `/etc/default/carla-scenario-monitor`
+
+Useful monitor commands on the host:
+
+```bash
+sudo systemctl status carla-scenario-monitor.service
+sudo systemctl restart carla-scenario-monitor.service
+sudo journalctl -u carla-scenario-monitor.service -f
+curl http://127.0.0.1:3001/api/orchestrator-status
 ```
 
 ## Environment
@@ -232,6 +252,8 @@ npm install
 npm run build
 PORT=3001 HOST=0.0.0.0 node build
 ```
+
+For production, install the systemd unit above and create `/etc/default/carla-scenario-monitor` from [deploy/systemd/carla-scenario-monitor.env.example](/Users/maikyon/Documents/Programming/carla-scenario-orchestrator/deploy/systemd/carla-scenario-monitor.env.example).
 
 Monitor environment example:
 
