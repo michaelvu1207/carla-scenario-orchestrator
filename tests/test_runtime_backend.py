@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, call, patch
+from unittest.mock import call, patch
 
 from orchestrator.config import Settings
 from orchestrator.models import GpuLeaseInfo
@@ -15,7 +15,7 @@ def make_settings() -> Settings:
     return Settings(
         repo_root=repo_root,
         jobs_root=repo_root / "runs",
-        gpu_devices=("0", "1"),
+        gpu_devices=("0", "1", "2"),
         carla_image="carla:test",
         carla_container_prefix="carla-orch",
         carla_startup_timeout_seconds=5,
@@ -26,8 +26,9 @@ def make_settings() -> Settings:
         python_executable="python3",
         docker_network_mode="host",
         carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
+        metadata_slot_index=2,
         carla_metadata_host="127.0.0.1",
-        carla_metadata_port=2000,
+        carla_metadata_port=2200,
         carla_metadata_timeout=20,
         storage_bucket=None,
         storage_region="us-east-1",
@@ -39,6 +40,7 @@ def make_slot() -> GpuLeaseInfo:
     return GpuLeaseInfo(
         slot_index=0,
         device_id="0",
+        role="execution",
         container_name="carla-orch-slot-0",
         carla_rpc_port=2000,
         traffic_manager_port=8000,
@@ -87,18 +89,24 @@ class RuntimeBackendTests(unittest.TestCase):
             with patch.object(backend, "_wait_for_tcp") as wait_mock:
                 backend._ensure_slot_container(slot)
 
-        self.assertEqual(run_mock.call_args_list[0], call(
-            ["docker", "inspect", "--format", "{{.State.Running}}", "carla-orch-slot-0"],
-            check=False,
-            capture_output=True,
-            text=True,
-        ))
-        self.assertEqual(run_mock.call_args_list[1], call(
-            ["docker", "rm", "-f", "carla-orch-slot-0"],
-            check=False,
-            capture_output=True,
-            text=True,
-        ))
+        self.assertEqual(
+            run_mock.call_args_list[0],
+            call(
+                ["docker", "inspect", "--format", "{{.State.Running}}", "carla-orch-slot-0"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+        )
+        self.assertEqual(
+            run_mock.call_args_list[1],
+            call(
+                ["docker", "rm", "-f", "carla-orch-slot-0"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ),
+        )
         start_call = run_mock.call_args_list[2]
         self.assertIn("--restart", start_call.args[0])
         self.assertIn("unless-stopped", start_call.args[0])

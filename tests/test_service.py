@@ -114,6 +114,7 @@ def sample_request() -> SimulationRunRequest:
 class ServiceTests(unittest.TestCase):
     def make_service(self, gpu_devices=("0", "1"), artifact_storage=None) -> OrchestratorService:
         temp_dir = Path(tempfile.mkdtemp(prefix="carla-orchestrator-tests-"))
+        metadata_slot_index = len(gpu_devices) - 1
         settings = Settings(
             repo_root=temp_dir,
             jobs_root=temp_dir / "runs",
@@ -128,8 +129,9 @@ class ServiceTests(unittest.TestCase):
             python_executable="python3",
             docker_network_mode="host",
             carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
+            metadata_slot_index=metadata_slot_index,
             carla_metadata_host="127.0.0.1",
-            carla_metadata_port=2000,
+            carla_metadata_port=2000 + metadata_slot_index * 100,
             carla_metadata_timeout=20,
             storage_bucket="simcloud-assets-public-test",
             storage_region="us-east-1",
@@ -155,6 +157,7 @@ class ServiceTests(unittest.TestCase):
         assert job is not None
         self.assertEqual(job.state, JobState.succeeded)
         self.assertEqual(job.gpu.device_id if job.gpu else None, "0")
+        self.assertEqual(job.gpu.role if job.gpu else None, "execution")
         self.assertEqual(job.container_name, "carla-orch-slot-0")
         self.assertEqual(len(job.events), 2)
         self.assertTrue(job.artifacts.recording_path.endswith("recording.mp4"))
@@ -169,8 +172,8 @@ class ServiceTests(unittest.TestCase):
                 blocker.wait(timeout=1)
                 return super().run_job(spec, on_event, cancel_event)
 
-        service = self.make_service(gpu_devices=("0",))
-        service = OrchestratorService(settings=service.settings, runtime_backend=BlockingRuntimeBackend())
+        base = self.make_service(gpu_devices=("0", "1"))
+        service = OrchestratorService(settings=base.settings, runtime_backend=BlockingRuntimeBackend())
         first = service.submit_job(sample_request())
         second = service.submit_job(sample_request())
         time.sleep(0.1)
@@ -235,6 +238,20 @@ class ServiceTests(unittest.TestCase):
         service.startup()
         service.startup()
         self.assertEqual(runtime_backend.initialize_calls, 1)
+
+    def test_health_uses_slot_readiness_without_live_metadata_rpc(self) -> None:
+        service = self.make_service()
+
+        class ExplodingMetadata:
+            def get_status(self):
+                raise AssertionError("health should not call live metadata RPC")
+
+        service.carla_metadata = ExplodingMetadata()
+        health = service.health()
+        self.assertTrue(health.carla_connected)
+        self.assertTrue(health.metadata_connected)
+        self.assertEqual(health.metadata_slot_index, 1)
+        self.assertEqual(health.total_slots, 1)
 
 
 if __name__ == "__main__":

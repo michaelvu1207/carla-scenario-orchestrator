@@ -21,6 +21,7 @@ class JobState(str, Enum):
 class GpuLeaseInfo(BaseModel):
     slot_index: int
     device_id: str
+    role: str = "execution"
     container_name: str
     carla_rpc_port: int
     traffic_manager_port: int
@@ -29,6 +30,7 @@ class GpuLeaseInfo(BaseModel):
 class CapacitySlot(BaseModel):
     slot_index: int
     device_id: str
+    role: str = "execution"
     container_name: str
     busy: bool = False
     job_id: str | None = None
@@ -44,6 +46,9 @@ class CapacityResponse(BaseModel):
     free_slots: int
     ready_slots: int
     unavailable_slots: int
+    metadata_slots: int = 0
+    metadata_ready: bool = False
+    metadata_slot_index: int | None = None
     slots: list[CapacitySlot] = Field(default_factory=list)
 
 
@@ -113,6 +118,8 @@ class HealthResponse(BaseModel):
     busy_slots: int
     queued_jobs: int
     carla_connected: bool = False
+    metadata_connected: bool = False
+    metadata_slot_index: int | None = None
     running: bool = False
     simulation_running: bool = False
     connections: int = 0

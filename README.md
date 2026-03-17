@@ -137,19 +137,18 @@ The production port sequence intentionally avoids very common service ranges.
 Current production ports:
 
 - orchestrator API: `18421`
-- CARLA metadata CARLA host/port: `127.0.0.1:2000`
 
-Persistent CARLA slot ports:
+Persistent internal CARLA slot ports:
 
-| Slot | GPU | CARLA RPC | Traffic Manager |
-| --- | --- | --- | --- |
-| 0 | 1 | 18467 | 19467 |
-| 1 | 2 | 18504 | 19504 |
-| 2 | 3 | 18541 | 19541 |
-| 3 | 4 | 18578 | 19578 |
-| 4 | 5 | 18615 | 19615 |
-| 5 | 6 | 18652 | 19652 |
-| 6 | 7 | 18689 | 19689 |
+| Slot | Role | GPU | CARLA RPC | Traffic Manager |
+| --- | --- | --- | --- | --- |
+| 0 | execution | 1 | 18467 | 19467 |
+| 1 | execution | 2 | 18504 | 19504 |
+| 2 | execution | 3 | 18541 | 19541 |
+| 3 | execution | 4 | 18578 | 19578 |
+| 4 | execution | 5 | 18615 | 19615 |
+| 5 | execution | 6 | 18652 | 19652 |
+| 6 | metadata/control | 7 | 18689 | 19689 |
 
 This comes from:
 
@@ -161,10 +160,11 @@ ORCH_PORT_STRIDE=37
 
 Notes:
 
-- `ORCH_CARLA_METADATA_PORT=2000` still points at the always-on local CARLA instance used for metadata queries such as map status, blueprint listing, and runtime map inspection
-- job execution CARLA containers do not use port `2000`; they use the uncommon per-slot port sequence above
+- `18421` is the only public control surface; frontends should not talk to CARLA RPC ports directly
+- the metadata/control CARLA lives on the reserved metadata slot and uses its fixed internal port from the slot table above
+- execution jobs only lease the six execution slots; the metadata/control slot is never handed to jobs
 - on startup the orchestrator ensures all seven slot containers are present and accepting connections before they are marked ready
-- if a slot container is missing when a job is assigned, the runtime backend recreates that slot container in place and keeps the stable slot name
+- if a slot container is missing, the runtime backend recreates that slot container in place and keeps the stable slot name
 
 ## Systemd
 
@@ -221,8 +221,8 @@ Important variables:
 - `ORCH_TRAFFIC_MANAGER_PORT_BASE`
 - `ORCH_PORT_STRIDE`
 - `ORCH_CARLA_TIMEOUT`
+- `ORCH_METADATA_SLOT_INDEX`
 - `ORCH_CARLA_METADATA_HOST`
-- `ORCH_CARLA_METADATA_PORT`
 - `ORCH_CARLA_METADATA_TIMEOUT`
 - `ORCH_DOCKER_NETWORK_MODE`
 - `ORCH_CARLA_START_COMMAND`
@@ -238,7 +238,7 @@ The container prefix is used to derive stable slot container names. With the pro
 - `carla-orch-slot-3`
 - `carla-orch-slot-4`
 - `carla-orch-slot-5`
-- `carla-orch-slot-6`
+- `carla-orch-metadata`
 
 Artifact upload layout:
 

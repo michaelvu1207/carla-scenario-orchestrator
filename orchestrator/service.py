@@ -56,11 +56,13 @@ class OrchestratorService:
             self.artifact_storage = S3ArtifactStorage(settings)
         else:
             self.artifact_storage = NullArtifactStorage()
+        metadata_slot = self.scheduler.metadata_slot()
         self.carla_metadata = CarlaMetadataService(
             host=settings.carla_metadata_host,
-            port=settings.carla_metadata_port,
+            port=metadata_slot.carla_rpc_port,
             timeout=settings.carla_metadata_timeout,
         )
+        self._metadata_slot_index = metadata_slot.slot_index
         self.llm = BedrockScenarioLLM()
         self.scene_assistant = BedrockSceneAssistant(carla_metadata=self.carla_metadata)
         self._cancel_events: dict[str, threading.Event] = {}
@@ -138,13 +140,16 @@ class OrchestratorService:
 
     def health(self) -> HealthResponse:
         capacity = self.scheduler.snapshot()
-        status = self.carla_metadata.get_status()
+        metadata_connected = capacity.metadata_ready
+        overall_status = "healthy" if capacity.unavailable_slots == 0 and metadata_connected else "degraded"
         return HealthResponse(
-            status="healthy" if capacity.unavailable_slots == 0 else "degraded",
+            status=overall_status,
             total_slots=capacity.total_slots,
             busy_slots=capacity.busy_slots,
             queued_jobs=self.store.queued_count(),
-            carla_connected=status.connected,
+            carla_connected=metadata_connected,
+            metadata_connected=metadata_connected,
+            metadata_slot_index=capacity.metadata_slot_index,
             running=capacity.busy_slots > 0,
             simulation_running=capacity.busy_slots > 0,
             connections=0,

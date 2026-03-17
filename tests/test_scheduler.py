@@ -9,12 +9,12 @@ from orchestrator.config import Settings
 from orchestrator.scheduler import GpuScheduler
 
 
-def make_settings() -> Settings:
+def make_settings(gpu_devices=("0", "1", "2"), metadata_slot_index=2) -> Settings:
     repo_root = Path("/tmp/carla-scenario-orchestrator-tests")
     return Settings(
         repo_root=repo_root,
         jobs_root=repo_root / "runs",
-        gpu_devices=("0", "1"),
+        gpu_devices=gpu_devices,
         carla_image="carla:test",
         carla_container_prefix="carla-orch",
         carla_startup_timeout_seconds=5,
@@ -25,8 +25,9 @@ def make_settings() -> Settings:
         python_executable="python3",
         docker_network_mode="host",
         carla_start_command_template="./CarlaUE4.sh -carla-rpc-port={rpc_port}",
+        metadata_slot_index=metadata_slot_index,
         carla_metadata_host="127.0.0.1",
-        carla_metadata_port=2000,
+        carla_metadata_port=2000 + metadata_slot_index * 100,
         carla_metadata_timeout=20,
         storage_bucket=None,
         storage_region="us-east-1",
@@ -35,42 +36,32 @@ def make_settings() -> Settings:
 
 
 class GpuSchedulerTests(unittest.TestCase):
-    def test_allocates_unique_ports_per_gpu(self) -> None:
+    def test_allocates_unique_ports_per_execution_gpu(self) -> None:
         scheduler = GpuScheduler(make_settings())
         lease_a = scheduler.acquire("job-a", threading.Event())
         lease_b = scheduler.acquire("job-b", threading.Event())
         self.assertNotEqual(lease_a.device_id, lease_b.device_id)
         self.assertEqual(lease_a.carla_rpc_port, 2000)
         self.assertEqual(lease_b.carla_rpc_port, 2100)
+        self.assertEqual(lease_a.role, "execution")
+        self.assertEqual(lease_b.role, "execution")
         scheduler.release("job-a")
         scheduler.release("job-b")
 
-    def test_waits_until_slot_is_free(self) -> None:
-        settings = make_settings()
-        scheduler = GpuScheduler(
-            Settings(
-                repo_root=settings.repo_root,
-                jobs_root=settings.jobs_root,
-                gpu_devices=("0",),
-                carla_image=settings.carla_image,
-                carla_container_prefix=settings.carla_container_prefix,
-                carla_startup_timeout_seconds=settings.carla_startup_timeout_seconds,
-                carla_rpc_port_base=settings.carla_rpc_port_base,
-                traffic_manager_port_base=settings.traffic_manager_port_base,
-                port_stride=settings.port_stride,
-                carla_timeout_seconds=settings.carla_timeout_seconds,
-                python_executable=settings.python_executable,
-                docker_network_mode=settings.docker_network_mode,
-                carla_start_command_template=settings.carla_start_command_template,
-                carla_metadata_host=settings.carla_metadata_host,
-                carla_metadata_port=settings.carla_metadata_port,
-                carla_metadata_timeout=settings.carla_metadata_timeout,
-                storage_bucket=None,
-                storage_region="us-east-1",
-                storage_prefix="runs",
-            )
-        )
-        first = scheduler.acquire("job-a", threading.Event())
+    def test_reserves_metadata_slot_from_job_leasing(self) -> None:
+        scheduler = GpuScheduler(make_settings())
+        snapshot = scheduler.snapshot()
+        self.assertEqual(snapshot.total_slots, 2)
+        self.assertEqual(snapshot.metadata_slots, 1)
+        self.assertTrue(snapshot.metadata_ready)
+        self.assertEqual(snapshot.metadata_slot_index, 2)
+        metadata_slots = [slot for slot in snapshot.slots if slot.role == "metadata"]
+        self.assertEqual(len(metadata_slots), 1)
+        self.assertEqual(metadata_slots[0].container_name, "carla-orch-metadata")
+
+    def test_waits_until_execution_slot_is_free(self) -> None:
+        scheduler = GpuScheduler(make_settings(gpu_devices=("0", "1"), metadata_slot_index=1))
+        scheduler.acquire("job-a", threading.Event())
         acquired: list[str] = []
 
         def worker() -> None:
@@ -85,7 +76,6 @@ class GpuSchedulerTests(unittest.TestCase):
         scheduler.release("job-a")
         thread.join(timeout=1)
         self.assertEqual(acquired, ["0"])
-        scheduler.release("job-a")
 
 
 if __name__ == "__main__":
