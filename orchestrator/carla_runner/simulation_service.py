@@ -1076,14 +1076,35 @@ def _simulation_worker(
                             },
                         )
                         continue
-                    _append_debug_log(
-                        debug_log,
-                        (
-                            f"Spawn failed for {actor.label} on road={actor.spawn.road_id} "
-                            f"section={actor.spawn.section_id} lane={actor.spawn.lane_id}."
-                        ),
+                    warn_msg = (
+                        f"Skipped {actor.label}: spawn failed on road={actor.spawn.road_id} "
+                        f"section={actor.spawn.section_id} lane={actor.spawn.lane_id}."
                     )
-                    raise RuntimeError(f"Failed to spawn vehicle {actor.label} on road {actor.spawn.road_id}.")
+                    _append_debug_log(debug_log, warn_msg)
+                    skipped_actor = {
+                        "id": actor.id,
+                        "label": actor.label,
+                        "road_id": actor.spawn.road_id,
+                        "section_id": actor.spawn.section_id,
+                        "lane_id": actor.spawn.lane_id,
+                        "s_fraction": actor.spawn.s_fraction,
+                        "reason": "spawn_failed",
+                    }
+                    skipped_actors.append(skipped_actor)
+                    _put_message(
+                        message_queue,
+                        {
+                            "kind": "stream",
+                            "payload": {
+                                "frame": frame,
+                                "timestamp": time.time(),
+                                "actors": [],
+                                "warning": warn_msg,
+                                "skipped_actor": skipped_actor,
+                            },
+                        },
+                    )
+                    continue
                 actors.append((actor, vehicle))
                 _append_debug_log(debug_log, f"Spawned vehicle {actor.label} handle_id={int(vehicle.id)}.")
                 actor_by_handle_id[int(vehicle.id)] = actor
@@ -1140,7 +1161,7 @@ def _simulation_worker(
                     timeline_states[actor.id].authored_route_applied = False
                 else:
                     _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
-            else:
+            elif actor.kind == "walker":
                 if actor.placement_mode in {"path", "point"} and actor.spawn_point is not None:
                     transform = _walker_transform_from_points(world, actor.spawn_point, actor.destination_point)
                 else:
@@ -1168,21 +1189,37 @@ def _simulation_worker(
                 walker = world.try_spawn_actor(blueprint, transform)
                 if walker is None:
                     if actor.placement_mode in {"path", "point"} and actor.spawn_point is not None:
-                        _append_debug_log(
-                            debug_log,
-                            f"Spawn failed for walker {actor.label} at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}).",
-                        )
-                        raise RuntimeError(
-                            f"Failed to spawn walker {actor.label} at ({actor.spawn_point.x:.1f}, {actor.spawn_point.y:.1f})."
-                        )
-                    _append_debug_log(
-                        debug_log,
-                        (
-                            f"Spawn failed for walker {actor.label} on road={actor.spawn.road_id} "
+                        warn_msg = f"Skipped walker {actor.label}: spawn failed at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f})."
+                    else:
+                        warn_msg = (
+                            f"Skipped walker {actor.label}: spawn failed on road={actor.spawn.road_id} "
                             f"section={actor.spawn.section_id} lane={actor.spawn.lane_id}."
-                        ),
+                        )
+                    _append_debug_log(debug_log, warn_msg)
+                    skipped_actor = {
+                        "id": actor.id,
+                        "label": actor.label,
+                        "road_id": actor.spawn.road_id,
+                        "section_id": actor.spawn.section_id,
+                        "lane_id": actor.spawn.lane_id,
+                        "s_fraction": actor.spawn.s_fraction,
+                        "reason": "spawn_failed",
+                    }
+                    skipped_actors.append(skipped_actor)
+                    _put_message(
+                        message_queue,
+                        {
+                            "kind": "stream",
+                            "payload": {
+                                "frame": frame,
+                                "timestamp": time.time(),
+                                "actors": [],
+                                "warning": warn_msg,
+                                "skipped_actor": skipped_actor,
+                            },
+                        },
                     )
-                    raise RuntimeError(f"Failed to spawn walker {actor.label} on road {actor.spawn.road_id}.")
+                    continue
                 if actor.placement_mode == "path" and actor.destination_point is not None:
                     destination_location = _location_from_map_point(world, actor.destination_point, z_offset=0.0)
                     path_walker_targets.append((walker, destination_location, max(0.5, actor.speed_kph / 3.6)))
@@ -1206,6 +1243,44 @@ def _simulation_worker(
                 _append_debug_log(debug_log, f"Spawned walker {actor.label} handle_id={int(walker.id)}.")
                 actor_by_handle_id[int(walker.id)] = actor
                 handle_by_actor_id[actor.id] = walker
+
+            elif actor.kind == "prop":
+                # Static props - spawn at freeform point or road anchor
+                if actor.spawn_point:
+                    loc = carla.Location(x=actor.spawn_point.x, y=-actor.spawn_point.y, z=0.5)
+                    transform = carla.Transform(loc, carla.Rotation())
+                else:
+                    anchor = _resolve_anchor(
+                        waypoint_index,
+                        actor,
+                        "spawn",
+                        exact_waypoint_index=exact_spawn_waypoint_index,
+                        carla_map=carla_map,
+                        road_length_lookup=road_lengths,
+                    )
+                    if anchor is None:
+                        _append_debug_log(debug_log, f"Prop {actor.label}: anchor resolution failed, skipping")
+                        continue
+                    transform = anchor.transform
+                    transform.location.z += 0.5
+
+                prop_bps = blueprint_library.filter(actor.blueprint)
+                if not prop_bps:
+                    _append_debug_log(debug_log, f"Prop {actor.label}: blueprint {actor.blueprint} not found, skipping")
+                    continue
+                prop_bp = prop_bps[0]
+
+                prop_handle = world.try_spawn_actor(prop_bp, transform)
+                if prop_handle is None:
+                    _append_debug_log(debug_log, f"Prop {actor.label}: spawn failed at {transform.location}, skipping")
+                    continue
+
+                actors.append((actor, prop_handle))
+                _append_debug_log(
+                    debug_log,
+                    f"Spawned prop {actor.label} blueprint={actor.blueprint} at "
+                    f"({transform.location.x}, {transform.location.y}, {transform.location.z})",
+                )
 
         if request.topdown_recording:
             sensor_bp = blueprint_library.find("sensor.camera.rgb")
@@ -1515,6 +1590,7 @@ def _simulation_worker(
                     timestamp=step * request.fixed_delta_seconds,
                     actors=[],
                     error=str(exc),
+                    event_kind="error",
                 ).model_dump(),
             },
         )
@@ -1585,6 +1661,7 @@ def _simulation_worker(
                             encoding=True,
                             encoding_total_frames=total_png,
                             encoding_encoded_frames=0,
+                            event_kind="encoding_progress",
                         ).model_dump(),
                     },
                 )
@@ -1601,6 +1678,7 @@ def _simulation_worker(
                                 encoding=True,
                                 encoding_total_frames=total,
                                 encoding_encoded_frames=encoded,
+                                event_kind="encoding_progress",
                             ).model_dump(),
                         },
                     )
@@ -1656,6 +1734,7 @@ def _simulation_worker(
                     simulation_ended=True,
                     recording=RecordingInfo.model_validate(recording) if recording else None,
                     skipped_actors=skipped_actors,
+                    event_kind="simulation_ended",
                 ).model_dump(),
             },
         )
@@ -1976,6 +2055,7 @@ class CarlaSimulationService:
                 actors=[],
                 error="Simulation was force-stopped after the worker stopped responding.",
                 simulation_ended=True,
+                event_kind="error",
             )
         )
         self._cleanup_worker_state()
@@ -2019,6 +2099,7 @@ class CarlaSimulationService:
                     timestamp=0.0,
                     actors=[],
                     simulation_ended=True,
+                    event_kind="simulation_ended",
                 )
             )
         elif exit_code not in {0, None} and not saw_terminal_message:
@@ -2029,6 +2110,7 @@ class CarlaSimulationService:
                     actors=[],
                     error=f"Simulation worker exited unexpectedly with code {exit_code}.",
                     simulation_ended=True,
+                    event_kind="error",
                 )
             )
 

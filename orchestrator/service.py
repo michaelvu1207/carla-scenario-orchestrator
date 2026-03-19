@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import requests as _requests_lib
 import threading
 import uuid
 from pathlib import Path
@@ -9,7 +11,6 @@ from .artifact_storage import ArtifactStorage, NullArtifactStorage, S3ArtifactSt
 from .config import Settings
 from .models import (
     CancelJobResponse,
-    CompatibilityRunResponse,
     HealthResponse,
     JobArtifacts,
     JobListResponse,
@@ -35,6 +36,9 @@ from .carla_runner.models import (
     SimulationRunRequest,
     SimulationStreamMessage,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorService:
@@ -104,14 +108,6 @@ class OrchestratorService:
         assert current is not None
         return JobSubmissionResponse(job_id=job_id, state=current.state, queue_position=current.queue_position)
 
-    def submit_compatibility_job(self, request: SimulationRunRequest) -> CompatibilityRunResponse:
-        response = self.submit_job(request)
-        return CompatibilityRunResponse(
-            status="accepted",
-            job_id=response.job_id,
-            state=response.state,
-            queue_position=response.queue_position,
-        )
 
     def get_job(self, job_id: str) -> JobRecord | None:
         return self.store.get(job_id)
@@ -173,7 +169,7 @@ class OrchestratorService:
         return self.carla_metadata.get_map_xodr()
 
     def map_generated(self) -> dict[str, object]:
-        return self.carla_metadata.get_generated_map()
+        return self.carla_metadata.get_generated_map_with_runtime()
 
     def actor_blueprints(self) -> dict[str, list[str]]:
         return self.carla_metadata.list_blueprints()
@@ -189,80 +185,6 @@ class OrchestratorService:
 
     def latest_running_job(self) -> JobRecord | None:
         return self.store.latest_running()
-
-    def simulation_status(self, job_id: str | None = None) -> dict[str, object]:
-        target = self.get_job(job_id) if job_id else None
-        if target is None:
-            target = self.latest_running_job() or self.latest_job()
-        if target is None:
-            return {
-                "status": "stopped",
-                "message": "No simulation is running",
-                "is_running": False,
-                "is_paused": False,
-                "job_id": None,
-                "queue_position": 0,
-            }
-
-        is_running = target.state in {JobState.starting, JobState.running}
-        is_paused = self.is_job_paused(target.job_id) if is_running else False
-
-        if target.state == JobState.queued:
-            status = "queued"
-            message = "Simulation job is queued"
-        elif is_running and is_paused:
-            status = "paused"
-            message = "Simulation is paused"
-        elif is_running:
-            status = "running"
-            message = "Simulation is running"
-        elif target.state == JobState.succeeded:
-            status = "succeeded"
-            message = "Latest simulation completed successfully"
-        elif target.state == JobState.failed:
-            status = "failed"
-            message = target.error or "Latest simulation failed"
-        elif target.state == JobState.cancelled:
-            status = "cancelled"
-            message = target.error or "Latest simulation was cancelled"
-        else:
-            status = "stopped"
-            message = "No simulation is running"
-
-        return {
-            "status": status,
-            "message": message,
-            "is_running": is_running,
-            "is_paused": is_paused,
-            "job_id": target.job_id,
-            "queue_position": target.queue_position,
-            "run_id": target.run_id,
-            "camera_recordings": bool(target.artifacts.recording_path),
-        }
-
-    def pause_job(self, job_id: str | None = None) -> dict[str, object]:
-        target = self.get_job(job_id) if job_id else self.latest_running_job()
-        if target is None:
-            return self.simulation_status(job_id)
-        pause_job = getattr(self.runtime_backend, "pause_job", None)
-        if pause_job is None or not pause_job(target.job_id):
-            raise RuntimeError("Pause is not available for the active runtime.")
-        return self.simulation_status(target.job_id)
-
-    def resume_job(self, job_id: str | None = None) -> dict[str, object]:
-        target = self.get_job(job_id) if job_id else self.latest_running_job()
-        if target is None:
-            return self.simulation_status(job_id)
-        resume_job = getattr(self.runtime_backend, "resume_job", None)
-        if resume_job is None or not resume_job(target.job_id):
-            raise RuntimeError("Resume is not available for the active runtime.")
-        return self.simulation_status(target.job_id)
-
-    def is_job_paused(self, job_id: str) -> bool:
-        is_job_paused = getattr(self.runtime_backend, "is_job_paused", None)
-        if is_job_paused is None:
-            return False
-        return bool(is_job_paused(job_id))
 
     def map_info(self) -> dict[str, object]:
         runtime_map = self.runtime_map()
@@ -319,12 +241,6 @@ class OrchestratorService:
                     return None
                 return self._read_run_diagnostics(Path(manifest_path))
         return None
-
-    def cancel_latest_running_job(self) -> CancelJobResponse | None:
-        job = self.latest_running_job()
-        if job is None:
-            return None
-        return self.cancel_job(job.job_id)
 
 
     def get_job_log(self, job_id: str) -> str | None:
@@ -442,6 +358,35 @@ class OrchestratorService:
         finally:
             self.scheduler.release(job_id)
             self.store.update_queue_positions()
+            self._fire_webhook(job_id)
+
+    def _fire_webhook(self, job_id: str) -> None:
+        url = self.settings.webhook_url
+        if not url:
+            return
+        job = self.store.get(job_id)
+        if job is None:
+            return
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self.settings.webhook_secret:
+            headers["Authorization"] = f"Bearer {self.settings.webhook_secret}"
+        body = job.model_dump(mode="json")
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                resp = _requests_lib.post(url, json=body, headers=headers, timeout=10)
+                logger.info("Webhook POST to %s completed status=%s job=%s", url, resp.status_code, job_id)
+                if resp.status_code < 500:
+                    return
+                logger.warning("Webhook POST to %s returned %s for job %s (attempt %d/%d)", url, resp.status_code, job_id, attempt + 1, max_attempts)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Webhook POST to %s failed for job %s (attempt %d/%d): %s", url, job_id, attempt + 1, max_attempts, exc)
+            if attempt < max_attempts - 1:
+                import time
+                backoff = 4 ** attempt  # 1s, 4s, 16s
+                logger.info("Retrying webhook in %ds...", backoff)
+                time.sleep(backoff)
+        logger.error("Webhook POST to %s failed after %d attempts for job %s", url, max_attempts, job_id)
 
     def _write_runtime_files(self, job: JobRecord, gpu) -> RuntimeLaunchSpec:
         job_dir = Path(job.artifacts.output_dir)

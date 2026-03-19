@@ -365,6 +365,22 @@ class CarlaMetadataService:
             self._last_xodr_map_name = normalized_map_name
         return copy.deepcopy(generated_map)
 
+    def get_generated_map_with_runtime(self, force_refresh: bool = False) -> dict[str, object]:
+        """Return generated map data with runtime road data merged under a 'runtime' key."""
+        generated = self.get_generated_map(force_refresh=force_refresh)
+        try:
+            runtime = self.get_runtime_map(force_refresh=force_refresh)
+            generated["runtime"] = {
+                "map_name": runtime.map_name,
+                "normalized_map_name": runtime.normalized_map_name,
+                "road_segments": [seg.model_dump() for seg in runtime.road_segments],
+                "road_summaries": [rs.model_dump() for rs in runtime.road_summaries],
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to merge runtime map data into generated map: %s", exc)
+            generated["runtime"] = None
+        return generated
+
     def list_blueprints(self) -> dict[str, list[str]]:
         with self._lock:
             cached = self._blueprints_cache

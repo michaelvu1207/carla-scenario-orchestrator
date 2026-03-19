@@ -58,8 +58,8 @@ class ActorTimelineClip(BaseModel):
 class ActorDraft(BaseModel):
     id: str
     label: str
-    kind: Literal["vehicle", "walker"]
-    role: Literal["ego", "traffic", "pedestrian"] = "traffic"
+    kind: Literal["vehicle", "walker", "prop"]
+    role: Literal["ego", "traffic", "pedestrian", "prop"] = "traffic"
     is_static: bool = False
     placement_mode: Literal["road", "path", "point"] = "road"
     blueprint: str
@@ -253,6 +253,7 @@ class SimulationStreamMessage(BaseModel):
 
     frame: int
     timestamp: float
+    event_kind: str = "frame"
     actors: list[SimulationActorState] = Field(default_factory=list)
     simulation_ended: bool = False
     error: str | None = None

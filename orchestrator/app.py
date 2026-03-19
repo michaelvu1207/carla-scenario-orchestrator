@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
 from .config import Settings
-from .models import CancelJobResponse, CompatibilityRunResponse, JobListResponse, JobRecord, JobSubmissionResponse
+from .models import CancelJobResponse, JobListResponse, JobRecord, JobSubmissionResponse
 from .service import OrchestratorService
 from .carla_runner.models import (
     LLMGenerateRequest,
@@ -81,6 +81,7 @@ async def map_info():
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+# DEPRECATED: runtime data is now included in GET /api/map/generated under the "runtime" key
 @app.get("/api/map/runtime")
 async def runtime_map():
     try:
@@ -178,76 +179,13 @@ async def job_stream(job_id: str, websocket: WebSocket):
         return
 
 
-@app.websocket("/api/simulation/stream")
-async def compatibility_stream(websocket: WebSocket, job_id: str | None = Query(default=None)):
-    if not job_id:
-        latest = service.latest_running_job()
-        job_id = latest.job_id if latest else None
-    if not job_id:
-        await websocket.accept()
-        await websocket.close(code=4404)
-        return
-    await job_stream(job_id, websocket)
 
 
-@app.post("/api/simulation/run", response_model=CompatibilityRunResponse)
-async def compatibility_run(request: SimulationRunRequest):
-    return service.submit_compatibility_job(request)
 
 
-@app.post("/api/simulation/stop")
-async def compatibility_stop(job_id: str | None = Query(default=None)):
-    if job_id:
-        try:
-            return service.cancel_job(job_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Job not found.") from exc
-    latest = service.cancel_latest_running_job()
-    if latest is None:
-        return {"status": "idle", "running": False}
-    return {"status": "stopping", "running": latest.state not in {"failed", "succeeded", "cancelled"}}
 
 
-@app.get("/api/simulation/status")
-async def compatibility_status(job_id: str | None = Query(default=None)):
-    return service.simulation_status(job_id)
 
-
-@app.post("/api/simulation/pause")
-async def compatibility_pause(job_id: str | None = Query(default=None)):
-    try:
-        return service.pause_job(job_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.post("/api/simulation/resume")
-async def compatibility_resume(job_id: str | None = Query(default=None)):
-    try:
-        return service.resume_job(job_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-
-@app.get("/api/simulation/recordings")
-async def simulation_recordings(source_run_id: str | None = Query(default=None)):
-    return {"items": [item.model_dump() for item in service.list_recordings(source_run_id=source_run_id)]}
-
-
-@app.get("/api/simulation/runs/latest")
-async def simulation_latest_run():
-    diagnostics = service.latest_run_diagnostics()
-    if diagnostics is None:
-        raise HTTPException(status_code=404, detail="No simulation runs found.")
-    return diagnostics
-
-
-@app.get("/api/simulation/runs/{run_id}")
-async def simulation_run_details(run_id: str):
-    diagnostics = service.job_diagnostics(run_id)
-    if diagnostics is None:
-        raise HTTPException(status_code=404, detail="Simulation run not found.")
-    return diagnostics
 
 
 
@@ -260,16 +198,27 @@ async def job_log(job_id: str):
     return {'log': log_text}
 
 
-@app.get('/api/simulation/log')
-async def simulation_log():
-    job = service.latest_running_job() or service.latest_job()
-    if job is None:
-        return {'log': ''}
-    log_text = service.get_job_log(job.job_id)
-    return {'log': log_text or ''}
 
-@app.get("/api/simulation/recordings/file")
-async def simulation_recording_file(path: str):
+@app.get("/api/jobs/{job_id}/diagnostics")
+async def job_diagnostics(job_id: str):
+    diagnostics = service.job_diagnostics(job_id)
+    if diagnostics is None:
+        raise HTTPException(status_code=404, detail="Diagnostics not found for this job.")
+    return diagnostics
+
+
+@app.get("/api/jobs/{job_id}/recordings")
+async def job_recordings(job_id: str):
+    job = service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    recordings = service.list_recordings()
+    matched = [r for r in recordings if r.run_id == job.run_id and job.run_id]
+    return {"items": [item.model_dump() for item in matched]}
+
+# DEPRECATED: legacy path was /api/simulation/recordings/file
+@app.get("/api/recordings/file")
+async def recording_file(path: str):
     file_path = Path(path).resolve()
     jobs_root = settings.jobs_root.resolve()
     if not file_path.is_relative_to(jobs_root):

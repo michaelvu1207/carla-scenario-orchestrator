@@ -128,12 +128,6 @@ class HealthResponse(BaseModel):
     langsmith_tracing: bool = False
 
 
-class CompatibilityRunResponse(BaseModel):
-    status: str
-    job_id: str
-    state: JobState
-    queue_position: int
-
 
 class RuntimeLaunchSpec(BaseModel):
     job_id: str

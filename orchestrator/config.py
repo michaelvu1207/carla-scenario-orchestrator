@@ -39,6 +39,8 @@ class Settings:
     storage_region: str
     storage_prefix: str
     warm_metadata_cache_on_startup: bool = True
+    webhook_url: str = ""
+    webhook_secret: str = ""
 
     @classmethod
     def load(cls) -> "Settings":
@@ -84,6 +86,8 @@ class Settings:
             carla_metadata_timeout=float(os.environ.get("ORCH_CARLA_METADATA_TIMEOUT", "20")),
             warm_metadata_cache_on_startup=os.environ.get("ORCH_WARM_METADATA_CACHE_ON_STARTUP", "true").lower()
             not in {"0", "false", "no"},
+            webhook_url=os.environ.get("ORCH_WEBHOOK_URL", ""),
+            webhook_secret=os.environ.get("ORCH_WEBHOOK_SECRET", ""),
             storage_bucket=(os.environ.get("ORCH_STORAGE_BUCKET") or "").strip() or None,
             storage_region=os.environ.get("ORCH_STORAGE_REGION")
             or os.environ.get("AWS_REGION")
