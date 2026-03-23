@@ -17,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import base64
+import io
 from typing import Any
 
 from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, normalize_map_name
@@ -453,6 +455,21 @@ def _vehicle_transform_from_points(world: Any, spawn_point: Any, destination_poi
     return carla.Transform(location, carla.Rotation(yaw=yaw))
 
 
+
+
+def _timed_path_heading_point(actor: Any) -> Any | None:
+    """For timed_path actors, find the first waypoint that differs from spawn_point to use as heading."""
+    if not actor.spawn_point or not actor.timed_waypoints:
+        return None
+    sx, sy = float(actor.spawn_point.x), float(actor.spawn_point.y)
+    for wp in actor.timed_waypoints:
+        dx = float(wp.x) - sx
+        dy = float(wp.y) - sy
+        if abs(dx) > 0.5 or abs(dy) > 0.5:
+            return wp
+    return None
+
+
 def _raised_waypoint_transform(
     waypoint: Any,
     z_offset: float,
@@ -734,12 +751,21 @@ def _apply_path_vehicle_control(
 
     steer = max(-1.0, min(1.0, yaw_error / (1.05 if reverse else 0.9)))
     cruise_speed = max(1.5, target_speed_mps)
-    throttle = 0.55 if reverse and speed < cruise_speed * 0.78 else 0.24 if reverse and speed < cruise_speed else 0.65 if speed < cruise_speed * 0.82 else 0.3 if speed < cruise_speed else 0.0
+    if reverse:
+        throttle = 0.55 if speed < cruise_speed * 0.78 else 0.24 if speed < cruise_speed else 0.0
+    elif speed < cruise_speed * 0.5:
+        throttle = 0.85  # aggressive acceleration when far below target speed
+    elif speed < cruise_speed * 0.82:
+        throttle = 0.65
+    elif speed < cruise_speed:
+        throttle = 0.3
+    else:
+        throttle = 0.0
     if abs(yaw_error) > 0.9:
         throttle *= 0.45 if reverse else 0.35
 
     brake = 0.0
-    if distance < 8.0 and speed > max(1.2, cruise_speed * 0.5):
+    if stop_at_target and distance < 8.0 and speed > max(1.2, cruise_speed * 0.5):
         brake = min(0.75, (speed - cruise_speed * 0.4) / max(cruise_speed, 1.0))
     if abs(yaw_error) > 1.35 and speed > 3.0:
         brake = max(brake, 0.3 if reverse else 0.45)
@@ -845,39 +871,143 @@ def _apply_path_walker_control(carla: Any, walker: Any, target_location: Any, ta
     return False
 
 
+
+def _compress_frame_jpeg(raw_data: bytes, width: int, height: int, quality: int = 50, debug_log: Path | None = None) -> str | None:
+    """Compress raw BGRA frame to JPEG and return base64-encoded string."""
+    try:
+        import numpy as np
+        arr = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 4))
+        # BGRA -> RGB
+        rgb = arr[:, :, [2, 1, 0]]
+        from PIL import Image
+        img = Image.fromarray(rgb)
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=quality)
+        result = base64.b64encode(buf.getvalue()).decode('ascii')
+        if debug_log is not None:
+            _append_debug_log(debug_log, f"JPEG compressed: {len(result)} chars")
+        return result
+    except Exception as exc:
+        if debug_log is not None:
+            _append_debug_log(debug_log, f"JPEG compression failed: {exc}")
+        return None
+
+
+class StreamingEncoder:
+    """Pipes raw BGRA frames directly into ffmpeg, skipping disk I/O."""
+
+    def __init__(self, output_path: Path, width: int, height: int, fps: int, gpu_device: int = 0):
+        self._output_path = output_path
+        self._frame_count = 0
+        self._width = width
+        self._height = height
+        # Use libx264 ultrafast — NVENC requires CUDA context which is not
+        # available to the orchestrator process on this server.
+        # The real speedup comes from piping raw frames (no disk I/O),
+        # not from the encoder choice.
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgra",
+            "-s", f"{width}x{height}",
+            "-r", str(max(1, fps)),
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def write_frame(self, raw_data: bytes) -> None:
+        if self._proc.stdin:
+            self._proc.stdin.write(raw_data)
+            self._frame_count += 1
+
+    @property
+    def frame_count(self) -> int:
+        return self._frame_count
+
+    def finish(self) -> Path:
+        if self._proc.stdin:
+            self._proc.stdin.close()
+        self._proc.wait()
+        if self._proc.returncode != 0:
+            stderr = self._proc.stderr.read().decode() if self._proc.stderr else ""
+            raise RuntimeError(f"ffmpeg failed (rc={self._proc.returncode}): {stderr[:500]}")
+        return self._output_path
+
+
 def _encode_mp4(frames_dir: Path, output_path: Path, fps: int, on_progress: Any = None) -> None:
-    png_pattern = str(frames_dir / "%06d.png")
-    numbers = sorted(int(path.stem) for path in frames_dir.glob("*.png") if path.stem.isdigit())
+    jpg_pattern = str(frames_dir / "%06d.jpg")
+    numbers = sorted(int(path.stem) for path in frames_dir.glob("*.jpg") if path.stem.isdigit())
     if not numbers:
         raise RuntimeError(f"No frames found in {frames_dir}")
     total_frames = len(numbers)
+    # Try NVENC first, fall back to libx264 ultrafast
     cmd = [
         "ffmpeg", "-y",
         "-start_number", str(numbers[0]),
         "-framerate", str(max(1, fps)),
-        "-i", png_pattern,
+        "-i", jpg_pattern,
         "-c:v", "libx264",
+        "-preset", "ultrafast",
+                "-crf", "23",
         "-pix_fmt", "yuv420p",
         str(output_path),
     ]
-    if on_progress is not None:
-        cmd.insert(-1, "-progress")
-        cmd.insert(-1, "pipe:1")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        encoded = 0
-        for raw_line in proc.stdout:
-            line = raw_line.strip()
-            if line.startswith("frame="):
-                try:
-                    encoded = int(line.split("=", 1)[1])
-                    on_progress(encoded, total_frames)
-                except (ValueError, IndexError):
-                    pass
-        proc.wait()
-        if proc.returncode != 0:
-            raise subprocess.CalledProcessError(proc.returncode, cmd)
-    else:
-        subprocess.run(cmd, check=True, capture_output=True)
+    try:
+        if on_progress is not None:
+            cmd.insert(-1, "-progress")
+            cmd.insert(-1, "pipe:1")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            encoded = 0
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if line.startswith("frame="):
+                    try:
+                        encoded = int(line.split("=", 1)[1])
+                        on_progress(encoded, total_frames)
+                    except (ValueError, IndexError):
+                        pass
+            proc.wait()
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+        else:
+            subprocess.run(cmd, check=True, capture_output=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # Fallback to CPU encoding
+        cmd = [
+            "ffmpeg", "-y",
+            "-start_number", str(numbers[0]),
+            "-framerate", str(max(1, fps)),
+            "-i", jpg_pattern,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-pix_fmt", "yuv420p",
+            str(output_path),
+        ]
+        if on_progress is not None:
+            cmd.insert(-1, "-progress")
+            cmd.insert(-1, "pipe:1")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            encoded = 0
+            for raw_line in proc.stdout:
+                line = raw_line.strip()
+                if line.startswith("frame="):
+                    try:
+                        encoded = int(line.split("=", 1)[1])
+                        on_progress(encoded, total_frames)
+                    except (ValueError, IndexError):
+                        pass
+            proc.wait()
+            if proc.returncode != 0:
+                raise subprocess.CalledProcessError(proc.returncode, cmd)
+        else:
+            subprocess.run(cmd, check=True, capture_output=True)
 
 
 def _put_message(message_queue: Any, payload: dict[str, Any]) -> None:
@@ -912,6 +1042,9 @@ def _simulation_worker(
     walker_controllers: list[Any] = []
     sensor = None
     sensor_queue = None
+    streaming_encoder = None
+    frame_jpeg_data: str | None = None
+    jpeg_frame_counter = 0
     world = None
     original_settings = None
     tm = None
@@ -923,8 +1056,9 @@ def _simulation_worker(
     last_sensor_frame = None
     worker_error = None
     skipped_actors: list[dict[str, Any]] = []
-    frame_writer_pool = ThreadPoolExecutor(max_workers=2)
+    frame_writer_pool = ThreadPoolExecutor(max_workers=8)
     path_vehicle_targets: list[tuple[Any, Any, float]] = []
+    timed_path_vehicle_targets: list[dict[str, Any]] = []
     path_walker_targets: list[tuple[Any, Any, float]] = []
     timeline_states: dict[str, TimelineActorState] = {}
     actor_by_handle_id: dict[int, ActorDraft] = {}
@@ -1012,9 +1146,9 @@ def _simulation_worker(
                     carla_map=carla_map,
                     road_length_lookup=road_lengths,
                 )
-                if actor.placement_mode in {"path", "point"} and actor.spawn_point is not None:
+                if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
                     vehicle_spawn_candidates = [
-                        _vehicle_transform_from_points(world, actor.spawn_point, actor.destination_point)
+                        _vehicle_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point)
                     ]
                 else:
                     vehicle_spawn_candidates = _road_spawn_transform_candidates(
@@ -1036,7 +1170,7 @@ def _simulation_worker(
                     blueprint.set_attribute("color", actor.color)
                 vehicle = _try_spawn_vehicle_from_candidates(world, blueprint, vehicle_spawn_candidates)
                 if vehicle is None:
-                    if actor.placement_mode in {"path", "point"} and actor.spawn_point is not None:
+                    if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
                         _append_debug_log(
                             debug_log,
                             f"Spawn failed for {actor.label} at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}).",
@@ -1152,6 +1286,21 @@ def _simulation_worker(
                     path_vehicle_targets.append(
                         (vehicle, destination_location, max(1.0, actor.speed_kph / 3.6))
                     )
+                elif actor.placement_mode == "timed_path":
+                    _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
+                    wp_locations = []
+                    for wp in (actor.timed_waypoints or []):
+                        wp_locations.append({
+                            "location": _location_from_map_point(world, wp, z_offset=0.0),
+                            "time": float(wp.time),
+                        })
+                    if wp_locations:
+                        timed_path_vehicle_targets.append({
+                            "vehicle": vehicle,
+                            "waypoints": wp_locations,
+                            "index": 1 if len(wp_locations) > 1 else 0,
+                            "max_speed_mps": max(1.0, actor.speed_kph / 3.6),
+                        })
                 elif actor.placement_mode == "point" or actor.is_static:
                     _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
                     vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0, hand_brake=True))
@@ -1162,8 +1311,8 @@ def _simulation_worker(
                 else:
                     _set_vehicle_autopilot(vehicle, False, settings["tm_port"])
             elif actor.kind == "walker":
-                if actor.placement_mode in {"path", "point"} and actor.spawn_point is not None:
-                    transform = _walker_transform_from_points(world, actor.spawn_point, actor.destination_point)
+                if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
+                    transform = _walker_transform_from_points(world, actor.spawn_point, _timed_path_heading_point(actor) if actor.placement_mode == "timed_path" else actor.destination_point)
                 else:
                     anchor = _resolve_anchor(
                         waypoint_index,
@@ -1188,7 +1337,7 @@ def _simulation_worker(
                 blueprint = blueprints[0]
                 walker = world.try_spawn_actor(blueprint, transform)
                 if walker is None:
-                    if actor.placement_mode in {"path", "point"} and actor.spawn_point is not None:
+                    if actor.placement_mode in {"path", "point", "timed_path"} and actor.spawn_point is not None:
                         warn_msg = f"Skipped walker {actor.label}: spawn failed at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f})."
                     else:
                         warn_msg = (
@@ -1295,6 +1444,19 @@ def _simulation_worker(
             sensor_queue = queue.Queue()
             sensor.listen(sensor_queue.put)
             _append_debug_log(debug_log, f"Camera sensor attached to actor_id={int(camera_parent.id)}.")
+            fps = int(round(1.0 / request.fixed_delta_seconds))
+            try:
+                streaming_encoder = StreamingEncoder(
+                    recording_path,
+                    width=request.recording_width,
+                    height=request.recording_height,
+                    fps=fps,
+                    gpu_device=settings.get("gpu_device", 0),
+                )
+                _append_debug_log(debug_log, "StreamingEncoder initialized (GPU pipe mode).")
+            except Exception as exc:
+                _append_debug_log(debug_log, f"StreamingEncoder failed, falling back to file-based: {exc}")
+                streaming_encoder = None
             try:
                 world.get_spectator().set_transform(sensor.get_transform())
             except Exception:
@@ -1504,6 +1666,52 @@ def _simulation_worker(
                 if int(route_target.get("index") or 0) < len(locations):
                     remaining_route_targets.append(route_target)
             route_vehicle_targets = remaining_route_targets
+
+            # --- Timed path vehicle control ---
+            remaining_timed_targets: list[dict[str, Any]] = []
+            for timed_target in timed_path_vehicle_targets:
+                vehicle = timed_target.get("vehicle")
+                waypoints = timed_target.get("waypoints") or []
+                wp_index = int(timed_target.get("index") or 0)
+                max_speed_mps = float(timed_target.get("max_speed_mps") or 10.0)
+                if not vehicle or not getattr(vehicle, "is_alive", False) or wp_index >= len(waypoints):
+                    if wp_index >= len(waypoints):
+                        _append_debug_log(debug_log, f"[TIMED] All {len(waypoints)} waypoints completed at t={simulation_time:.2f}s")
+                    continue
+                target_wp = waypoints[wp_index]
+                target_location = target_wp["location"]
+                target_time = target_wp["time"]
+                time_remaining = max(0.05, target_time - simulation_time)
+                transform = vehicle.get_transform()
+                loc = transform.location
+                dx = float(target_location.x) - float(loc.x)
+                dy = float(target_location.y) - float(loc.y)
+                distance = math.sqrt(dx * dx + dy * dy)
+                desired_speed_mps = min(max_speed_mps, distance / time_remaining)
+                if simulation_time > target_time:
+                    desired_speed_mps = max_speed_mps
+                is_final = wp_index >= len(waypoints) - 1
+                reached = _apply_path_vehicle_control(
+                    carla, vehicle, target_location, desired_speed_mps,
+                    stop_at_target=is_final,
+                    arrival_distance_m=3.0 if not is_final else 2.5,
+                )
+                if reached:
+                    _append_debug_log(debug_log, f"[TIMED] Reached wp {wp_index}/{len(waypoints)-1} at t={simulation_time:.2f}s (target t={target_time:.1f}s) dist={distance:.1f}m")
+                    timed_target["index"] = wp_index + 1
+                new_index = int(timed_target.get("index") or 0)
+                if new_index < len(waypoints):
+                    remaining_timed_targets.append(timed_target)
+                    if step % 20 == 0:  # Log every 1 second
+                        v = vehicle.get_velocity()
+                        actual_speed = math.sqrt(float(v.x)**2 + float(v.y)**2 + float(v.z)**2)
+                        ctrl = vehicle.get_control()
+                        _append_debug_log(debug_log, f"[TIMED] t={simulation_time:.2f}s wp={new_index}/{len(waypoints)-1} dist={distance:.1f}m spd={actual_speed:.1f}/{desired_speed_mps:.1f}m/s thr={ctrl.throttle:.2f} brk={ctrl.brake:.2f} str={ctrl.steer:.2f}")
+                else:
+                    vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+                    _append_debug_log(debug_log, f"[TIMED] All waypoints done, braking at t={simulation_time:.2f}s")
+            timed_path_vehicle_targets = remaining_timed_targets
+
             remaining_walker_targets: list[tuple[Any, Any, float]] = []
             for walker, target_location, target_speed_mps in path_walker_targets:
                 if not walker or not walker.is_alive:
@@ -1531,8 +1739,22 @@ def _simulation_worker(
             if sensor_queue is not None:
                 try:
                     image = sensor_queue.get(timeout=2.0)
-                    dest = str(frames_dir / f"{image.frame:06d}.png")
-                    frame_writer_pool.submit(image.save_to_disk, dest)
+                    if streaming_encoder is not None:
+                        raw_bytes = bytes(image.raw_data)
+                        streaming_encoder.write_frame(raw_bytes)
+                        # Compress every 2nd frame to JPEG for live preview (throttle to ~10fps)
+                        jpeg_frame_counter += 1
+                        if jpeg_frame_counter % 2 == 0:
+                            frame_jpeg_data = _compress_frame_jpeg(
+                                raw_bytes, request.recording_width, request.recording_height,
+                                debug_log=debug_log
+                            )
+                        else:
+                            frame_jpeg_data = None
+                    else:
+                        dest = str(frames_dir / f"{image.frame:06d}.jpg")
+                        frame_writer_pool.submit(image.save_to_disk, dest)
+                        frame_jpeg_data = None
                     saved_frame_count += 1
                     last_sensor_frame = int(image.frame)
                 except queue.Empty:
@@ -1574,6 +1796,7 @@ def _simulation_worker(
                         frame=frame,
                         timestamp=step * request.fixed_delta_seconds,
                         actors=[SimulationActorState.model_validate(item) for item in actor_states],
+                        frame_jpeg=frame_jpeg_data,
                     ).model_dump(),
                 },
             )
@@ -1638,35 +1861,42 @@ def _simulation_worker(
             destroy_handles.extend(actor for _, actor in actors if actor is not None)
             _destroy_carla_handles(client, destroy_handles, debug_log)
 
-        _append_debug_log(debug_log, "Waiting for frame writer pool to finish.")
-        try:
-            frame_writer_pool.shutdown(wait=True)
-        except Exception as exc:  # noqa: BLE001
-            _append_debug_log(debug_log, f"Frame writer pool shutdown error: {exc}")
-
         recording = None
-        if frames_dir.exists() and any(frames_dir.glob("*.png")):
+        if streaming_encoder is not None:
+            _append_debug_log(debug_log, "Waiting for frame writer pool to finish (streaming mode).")
             try:
-                fps = int(round(1.0 / request.fixed_delta_seconds))
-                total_png = len(list(frames_dir.glob("*.png")))
-                _append_debug_log(debug_log, f"Encoding MP4: {total_png} frames at {fps} fps.")
-                _put_message(
-                    message_queue,
-                    {
-                        "kind": "stream",
-                        "payload": SimulationStreamMessage(
-                            frame=frame,
-                            timestamp=request.duration_seconds,
-                            actors=[],
-                            encoding=True,
-                            encoding_total_frames=total_png,
-                            encoding_encoded_frames=0,
-                            event_kind="encoding_progress",
-                        ).model_dump(),
-                    },
-                )
+                frame_writer_pool.shutdown(wait=True)
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Frame writer pool shutdown error: {exc}")
+            try:
+                _append_debug_log(debug_log, f"Finishing streaming encode: {streaming_encoder.frame_count} frames.")
+                streaming_encoder.finish()
+                recording = RecordingInfo(
+                    run_id=run_id,
+                    label=f"{normalize_map_name(request.map_name)} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    mp4_path=str(recording_path),
+                    frames_path=None,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                ).model_dump()
+                saved_frame_count = streaming_encoder.frame_count
+                _append_debug_log(debug_log, f"Streaming encode complete: {saved_frame_count} frames.")
+            except Exception as exc:  # noqa: BLE001
+                error_path = run_dir / "encoding_error.txt"
+                error_path.write_text(str(exc), encoding="utf-8")
+                _append_debug_log(debug_log, f"Streaming encode failed: {exc}")
+                worker_error = str(exc)
+        else:
+            _append_debug_log(debug_log, "Waiting for frame writer pool to finish.")
+            try:
+                frame_writer_pool.shutdown(wait=True)
+            except Exception as exc:  # noqa: BLE001
+                _append_debug_log(debug_log, f"Frame writer pool shutdown error: {exc}")
 
-                def _on_encode_progress(encoded: int, total: int) -> None:
+            if frames_dir.exists() and any(frames_dir.glob("*.jpg")):
+                try:
+                    fps = int(round(1.0 / request.fixed_delta_seconds))
+                    total_jpg = len(list(frames_dir.glob("*.jpg")))
+                    _append_debug_log(debug_log, f"Encoding MP4: {total_jpg} frames at {fps} fps.")
                     _put_message(
                         message_queue,
                         {
@@ -1676,29 +1906,46 @@ def _simulation_worker(
                                 timestamp=request.duration_seconds,
                                 actors=[],
                                 encoding=True,
-                                encoding_total_frames=total,
-                                encoding_encoded_frames=encoded,
+                                encoding_total_frames=total_jpg,
+                                encoding_encoded_frames=0,
                                 event_kind="encoding_progress",
                             ).model_dump(),
                         },
                     )
 
-                _encode_mp4(frames_dir, recording_path, fps, on_progress=_on_encode_progress)
-                recording = RecordingInfo(
-                    run_id=run_id,
-                    label=f"{normalize_map_name(request.map_name)} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                    mp4_path=str(recording_path),
-                    frames_path=str(frames_dir),
-                    created_at=datetime.now(timezone.utc).isoformat(),
-                ).model_dump()
-                _append_debug_log(
-                    debug_log,
-                    f"MP4 encoded successfully frames={saved_frame_count} fps={fps} path={recording_path}.",
-                )
-            except Exception as exc:  # noqa: BLE001
-                error_path = run_dir / "encoding_error.txt"
-                error_path.write_text(str(exc), encoding="utf-8")
-                _append_debug_log(debug_log, f"MP4 encoding failed: {exc}")
+                    def _on_encode_progress(encoded: int, total: int) -> None:
+                        _put_message(
+                            message_queue,
+                            {
+                                "kind": "stream",
+                                "payload": SimulationStreamMessage(
+                                    frame=frame,
+                                    timestamp=request.duration_seconds,
+                                    actors=[],
+                                    encoding=True,
+                                    encoding_total_frames=total,
+                                    encoding_encoded_frames=encoded,
+                                    event_kind="encoding_progress",
+                                ).model_dump(),
+                            },
+                        )
+
+                    _encode_mp4(frames_dir, recording_path, fps, on_progress=_on_encode_progress)
+                    recording = RecordingInfo(
+                        run_id=run_id,
+                        label=f"{normalize_map_name(request.map_name)} {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        mp4_path=str(recording_path),
+                        frames_path=str(frames_dir),
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                    ).model_dump()
+                    _append_debug_log(
+                        debug_log,
+                        f"MP4 encoded successfully frames={saved_frame_count} fps={fps} path={recording_path}.",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error_path = run_dir / "encoding_error.txt"
+                    error_path.write_text(str(exc), encoding="utf-8")
+                    _append_debug_log(debug_log, f"MP4 encoding failed: {exc}")
 
         manifest = {
             "map_name": request.map_name,

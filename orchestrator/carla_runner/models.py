@@ -28,6 +28,12 @@ class ActorMapPoint(BaseModel):
     y: float
 
 
+class TimedWaypoint(BaseModel):
+    x: float
+    y: float
+    time: float
+
+
 TimelineAction = Literal[
     "follow_route",
     "set_speed",
@@ -61,7 +67,7 @@ class ActorDraft(BaseModel):
     kind: Literal["vehicle", "walker", "prop"]
     role: Literal["ego", "traffic", "pedestrian", "prop"] = "traffic"
     is_static: bool = False
-    placement_mode: Literal["road", "path", "point"] = "road"
+    placement_mode: Literal["road", "path", "point", "timed_path"] = "road"
     blueprint: str
     spawn: ActorRoadAnchor
     spawn_point: ActorMapPoint | None = None
@@ -74,6 +80,7 @@ class ActorDraft(BaseModel):
     autopilot: bool = True
     color: str | None = None
     notes: str | None = None
+    timed_waypoints: list[TimedWaypoint] = Field(default_factory=list)
     timeline: list[ActorTimelineClip] = Field(default_factory=list)
 
 
@@ -258,3 +265,4 @@ class SimulationStreamMessage(BaseModel):
     simulation_ended: bool = False
     error: str | None = None
     recording: RecordingInfo | None = None
+    frame_jpeg: str | None = None

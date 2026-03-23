@@ -8,6 +8,19 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+class PrivateNetworkAccessMiddleware(BaseHTTPMiddleware):
+    """Allow Chrome Private Network Access (PNA) for Tailscale Funnel."""
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        if request.headers.get("access-control-request-private-network") == "true":
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        return response
+
 from .config import Settings
 from .models import CancelJobResponse, JobListResponse, JobRecord, JobSubmissionResponse
 from .service import OrchestratorService
@@ -34,10 +47,13 @@ app = FastAPI(title="CARLA Scenario Orchestrator", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(PrivateNetworkAccessMiddleware)
+
 
 
 @app.get("/api/health")

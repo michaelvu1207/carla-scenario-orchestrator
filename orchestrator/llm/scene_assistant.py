@@ -1014,8 +1014,14 @@ class SceneEditorState:
 
 class BedrockSceneAssistant:
     def __init__(self, carla_metadata: Any | None = None) -> None:
-        region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
-        self.client = boto3.client("bedrock-runtime", region_name=region)
+        region = os.environ.get("AWS_BEDROCK_REGION") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
+        bedrock_kwargs: dict[str, Any] = {"region_name": region}
+        bedrock_key = os.environ.get("AWS_BEDROCK_ACCESS_KEY_ID")
+        bedrock_secret = os.environ.get("AWS_BEDROCK_SECRET_ACCESS_KEY")
+        if bedrock_key and bedrock_secret:
+            bedrock_kwargs["aws_access_key_id"] = bedrock_key
+            bedrock_kwargs["aws_secret_access_key"] = bedrock_secret
+        self.client = boto3.client("bedrock-runtime", **bedrock_kwargs)
         self.model_id = ""
         self.carla_metadata = carla_metadata
 

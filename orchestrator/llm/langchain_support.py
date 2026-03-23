@@ -69,13 +69,24 @@ def langsmith_run_config(name: str, *, tags: list[str] | None = None, metadata: 
 def create_chat_model(model_id: str, *, temperature: float, max_tokens: int):
     if not LANGCHAIN_AVAILABLE or ChatBedrockConverse is None:
         raise RuntimeError(f"LangChain Bedrock support is unavailable: {LANGCHAIN_IMPORT_ERROR}")
-    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
-    return ChatBedrockConverse(
-        model=model_id,
-        region_name=region,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    region = os.environ.get("AWS_BEDROCK_REGION") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
+    kwargs: dict = {
+        "model": model_id,
+        "region_name": region,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    bedrock_key = os.environ.get("AWS_BEDROCK_ACCESS_KEY_ID")
+    bedrock_secret = os.environ.get("AWS_BEDROCK_SECRET_ACCESS_KEY")
+    if bedrock_key and bedrock_secret:
+        import boto3
+        kwargs["client"] = boto3.client(
+            "bedrock-runtime",
+            region_name=region,
+            aws_access_key_id=bedrock_key,
+            aws_secret_access_key=bedrock_secret,
+        )
+    return ChatBedrockConverse(**kwargs)
 
 
 def serialize_ai_message(message: Any) -> dict[str, Any]:
