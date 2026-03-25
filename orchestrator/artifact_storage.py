@@ -86,6 +86,54 @@ class S3ArtifactStorage:
                     s3_uri=f"s3://{self.bucket}/{key}",
                 )
             )
+
+        # Upload per-sensor MP4 recordings as individually tracked artifacts
+        job_dir = Path(job.artifacts.output_dir)
+        # Sensor videos are at: {run_dir}/sensors/{sensor_id}/recording.mp4
+        # The run_id subdirectory is the actual run output dir
+        if job.run_id:
+            sensors_dir = job_dir / job.run_id / "sensors"
+            if sensors_dir.is_dir():
+                # Read sensor labels from manifest if available
+                sensor_labels: dict[str, str] = {}
+                try:
+                    import json as _json
+                    manifest_path = job_dir / job.run_id / "manifest.json"
+                    if manifest_path.exists():
+                        manifest = _json.loads(manifest_path.read_text())
+                        sensor_labels = manifest.get("sensor_labels") or {}
+                except Exception:
+                    pass
+                for sensor_dir in sorted(sensors_dir.iterdir()):
+                    if not sensor_dir.is_dir():
+                        continue
+                    mp4 = sensor_dir / "recording.mp4"
+                    if not mp4.is_file():
+                        continue
+                    sensor_id = sensor_dir.name
+                    label = sensor_labels.get(sensor_id, sensor_id)
+                    key = f"{prefix}/sensors/{sensor_id}/recording.mp4"
+                    self.client.upload_file(
+                        str(mp4),
+                        self.bucket,
+                        key,
+                        ExtraArgs={"ContentType": "video/mp4"},
+                    )
+                    uploaded.append(
+                        StoredArtifact(
+                            kind="MP4",
+                            label=label,
+                            local_path=str(mp4),
+                            content_type="video/mp4",
+                            file_ext="mp4",
+                            size_bytes=mp4.stat().st_size,
+                            checksum_sha256=_checksum_sha256(mp4),
+                            s3_bucket=self.bucket,
+                            s3_key=key,
+                            s3_uri=f"s3://{self.bucket}/{key}",
+                        )
+                    )
+
         return uploaded
 
 
@@ -108,8 +156,8 @@ class S3ArtifactStorage:
                     continue
                 if str(file_path) in already_uploaded:
                     continue
-                # Skip very large frame directories (individual JPEGs)
-                if file_path.suffix.lower() in ('.jpg', '.jpeg', '.png') and 'ego_camera_frames' in str(file_path):
+                # Skip raw sensor frame files — only upload encoded MP4s, not individual frames
+                if file_path.suffix.lower() in ('.jpg', '.jpeg', '.png', '.ply', '.csv'):
                     continue
                 rel = file_path.relative_to(job_dir)
                 key = f"{prefix}/{rel}"

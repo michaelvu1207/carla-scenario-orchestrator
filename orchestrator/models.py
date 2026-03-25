@@ -96,6 +96,7 @@ class JobRecord(BaseModel):
     run_id: str | None = None
     events: list[JobEvent] = Field(default_factory=list)
     artifacts: JobArtifacts
+    simulation_id: str | None = None
 
 
 class JobSubmissionResponse(BaseModel):

@@ -142,6 +142,7 @@ class SimulationRunRequest(BaseModel):
     recording_width: int = Field(default=1280, ge=320, le=3840)
     recording_height: int = Field(default=720, ge=240, le=2160)
     recording_fov: float = Field(default=90.0, ge=30.0, le=140.0)
+    sensors: list[SensorConfig] = Field(default_factory=list)
 
 
 class RecordingInfo(BaseModel):
@@ -266,3 +267,46 @@ class SimulationStreamMessage(BaseModel):
     error: str | None = None
     recording: RecordingInfo | None = None
     frame_jpeg: str | None = None
+
+
+# ── Sensor Configuration (multi-sensor support) ──
+
+class SensorPose(BaseModel):
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    roll: float = 0.0
+    pitch: float = 0.0
+    yaw: float = 0.0
+
+
+class SensorConfig(BaseModel):
+    """Individual sensor configuration sent from the frontend."""
+    id: str
+    label: str
+    sensor_category: Literal["camera", "lidar", "radar", "imu", "gnss"] = "camera"
+    output_modality: str = "rgb"
+    attachment_type: Literal["rigid", "spring_arm", "spring_arm_ghost"] = "rigid"
+    pose: SensorPose = Field(default_factory=SensorPose)
+    update_rate: float = Field(default=30.0, ge=0.0, le=60.0)
+    attach_to: str = "ego"  # actor ID or "world"
+
+    # Camera-specific
+    width: int = Field(default=1920, ge=320, le=3840)
+    height: int = Field(default=1080, ge=240, le=2160)
+    fov: float = Field(default=90.0, ge=1.0, le=179.0)
+
+    # LiDAR-specific
+    channels: int = Field(default=64, ge=1, le=128)
+    range_m: float = Field(default=100.0, ge=1.0, le=200.0)
+    points_per_second: int = Field(default=1_200_000, ge=100)
+    rotation_frequency: float = Field(default=20.0, ge=1.0, le=60.0)
+
+    # Radar-specific
+    horizontal_fov: float = Field(default=30.0, ge=1.0, le=179.0)
+    vertical_fov: float = Field(default=30.0, ge=1.0, le=179.0)
+    radar_range: float = Field(default=100.0, ge=1.0, le=300.0)
+
+    # World-placed cameras
+    world_position: ActorMapPoint | None = None
+    world_rotation: SensorPose | None = None

@@ -22,6 +22,8 @@ import io
 from typing import Any
 
 from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, normalize_map_name
+from .sensor_spawner import spawn_sensors, collect_sensor_frames, destroy_all_sensors
+from .sensor_encoder import encode_all_sensors
 from .models import (
     ActorDraft,
     ActorTimelineClip,
@@ -870,29 +872,6 @@ def _apply_path_walker_control(carla: Any, walker: Any, target_location: Any, ta
         pass
     return False
 
-
-
-def _compress_frame_jpeg(raw_data: bytes, width: int, height: int, quality: int = 50, debug_log: Path | None = None) -> str | None:
-    """Compress raw BGRA frame to JPEG and return base64-encoded string."""
-    try:
-        import numpy as np
-        arr = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, 4))
-        # BGRA -> RGB
-        rgb = arr[:, :, [2, 1, 0]]
-        from PIL import Image
-        img = Image.fromarray(rgb)
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=quality)
-        result = base64.b64encode(buf.getvalue()).decode('ascii')
-        if debug_log is not None:
-            _append_debug_log(debug_log, f"JPEG compressed: {len(result)} chars")
-        return result
-    except Exception as exc:
-        if debug_log is not None:
-            _append_debug_log(debug_log, f"JPEG compression failed: {exc}")
-        return None
-
-
 class StreamingEncoder:
     """Pipes raw BGRA frames directly into ffmpeg, skipping disk I/O."""
 
@@ -1044,8 +1023,6 @@ def _simulation_worker(
     sensor = None
     sensor_queue = None
     streaming_encoder = None
-    frame_jpeg_data: str | None = None
-    jpeg_frame_counter = 0
     world = None
     original_settings = None
     tm = None
@@ -1057,6 +1034,7 @@ def _simulation_worker(
     last_sensor_frame = None
     worker_error = None
     skipped_actors: list[dict[str, Any]] = []
+    spawned_sensors = []  # Multi-sensor support
     frame_writer_pool = ThreadPoolExecutor(max_workers=8)
     path_vehicle_targets: list[tuple[Any, Any, float]] = []
     timed_path_vehicle_targets: list[dict[str, Any]] = []
@@ -1471,6 +1449,21 @@ def _simulation_worker(
             except Exception:
                 pass
 
+
+        # ── Spawn multi-sensor rig (from frontend) ──
+        if request.sensors:
+            _append_debug_log(debug_log, f"Spawning {len(request.sensors)} sensors from frontend config.")
+            actor_label_map = {draft.label: handle for draft, handle in actors if handle is not None}
+            spawned_sensors = spawn_sensors(
+                world=world,
+                blueprint_library=blueprint_library,
+                sensor_configs=request.sensors,
+                actor_map=actor_label_map,
+                ego_vehicle=ego_vehicle,
+                job_dir=run_dir,
+            )
+            _append_debug_log(debug_log, f"Spawned {len(spawned_sensors)} sensors successfully.")
+
         max_steps = int(request.duration_seconds / request.fixed_delta_seconds)
         for step in range(max_steps):
             if stop_event.is_set():
@@ -1758,19 +1751,9 @@ def _simulation_worker(
                     if streaming_encoder is not None:
                         raw_bytes = bytes(image.raw_data)
                         streaming_encoder.write_frame(raw_bytes)
-                        # Compress every 2nd frame to JPEG for live preview (throttle to ~10fps)
-                        jpeg_frame_counter += 1
-                        if jpeg_frame_counter % 2 == 0:
-                            frame_jpeg_data = _compress_frame_jpeg(
-                                raw_bytes, request.recording_width, request.recording_height,
-                                debug_log=debug_log
-                            )
-                        else:
-                            frame_jpeg_data = None
                     else:
                         dest = str(frames_dir / f"{image.frame:06d}.jpg")
                         frame_writer_pool.submit(image.save_to_disk, dest)
-                        frame_jpeg_data = None
                     saved_frame_count += 1
                     last_sensor_frame = int(image.frame)
                 except queue.Empty:
@@ -1780,6 +1763,9 @@ def _simulation_worker(
                     world.get_spectator().set_transform(sensor.get_transform())
                 except Exception:
                     pass
+            # Collect frames from all multi-sensor spawned sensors
+            if spawned_sensors:
+                collect_sensor_frames(spawned_sensors, timeout=1.5)
             actor_states: list[dict[str, Any]] = []
             for actor_draft, handle in actors:
                 if not handle or not handle.is_alive:
@@ -1808,12 +1794,20 @@ def _simulation_worker(
                 message_queue,
                 {
                     "kind": "stream",
-                    "payload": SimulationStreamMessage(
-                        frame=frame,
-                        timestamp=step * request.fixed_delta_seconds,
-                        actors=[SimulationActorState.model_validate(item) for item in actor_states],
-                        frame_jpeg=frame_jpeg_data,
-                    ).model_dump(),
+                    "payload": {
+                        **SimulationStreamMessage(
+                            frame=frame,
+                            timestamp=step * request.fixed_delta_seconds,
+                            actors=[SimulationActorState.model_validate(item) for item in actor_states],
+                            frame_jpeg=None,
+                            event_kind="simulation_tick",
+                        ).model_dump(),
+                        "phase": "simulating",
+                        "phase_detail": f"Simulating {step * request.fixed_delta_seconds:.1f}s / {request.duration_seconds:.0f}s",
+                        "sensor_count": len(spawned_sensors) + (1 if sensor else 0),
+                        "step": step,
+                        "total_steps": max_steps,
+                    },
                 },
             )
     except Exception as exc:  # noqa: BLE001
@@ -1835,6 +1829,22 @@ def _simulation_worker(
         )
     finally:
         _append_debug_log(debug_log, "Finalizing simulation run.")
+        _put_message(
+            message_queue,
+            {
+                "kind": "stream",
+                "payload": {
+                    **SimulationStreamMessage(
+                        frame=frame,
+                        timestamp=request.duration_seconds,
+                        actors=[],
+                        event_kind="phase_change",
+                    ).model_dump(),
+                    "phase": "finalizing",
+                    "phase_detail": "Cleaning up actors and sensors",
+                },
+            },
+        )
         if carla_client is not None:
             # Reuse the persistent client for cleanup (don't create a second connection)
             client = carla_client
@@ -1872,6 +1882,11 @@ def _simulation_worker(
                 client.stop_recorder()
             except Exception as exc:  # noqa: BLE001
                 _append_debug_log(debug_log, f"Failed to stop CARLA recorder: {exc}")
+
+        # Destroy multi-sensor spawned sensors
+        if spawned_sensors:
+            _append_debug_log(debug_log, f"Destroying {len(spawned_sensors)} spawned sensors.")
+            destroy_all_sensors(spawned_sensors)
 
         if client is not None:
             destroy_handles: list[Any] = []
@@ -1967,7 +1982,65 @@ def _simulation_worker(
                     error_path.write_text(str(exc), encoding="utf-8")
                     _append_debug_log(debug_log, f"MP4 encoding failed: {exc}")
 
+        # -- Per-sensor video encoding --
+        sensor_encode_results = {}
+        if spawned_sensors:
+            _append_debug_log(debug_log, f"Encoding {len(spawned_sensors)} sensor outputs.")
+            _put_message(
+                message_queue,
+                {
+                    "kind": "stream",
+                    "payload": {
+                        **SimulationStreamMessage(
+                            frame=frame,
+                            timestamp=request.duration_seconds,
+                            actors=[],
+                            event_kind="phase_change",
+                        ).model_dump(),
+                        "phase": "encoding_sensors",
+                        "phase_detail": f"Encoding {len(spawned_sensors)} sensor videos",
+                        "sensor_count": len(spawned_sensors),
+                    },
+                },
+            )
+            fps_enc = int(round(1.0 / request.fixed_delta_seconds))
+            def _on_sensor_encode_progress(done, total):
+                _put_message(
+                    message_queue,
+                    {
+                        "kind": "stream",
+                        "payload": {
+                            **SimulationStreamMessage(
+                                frame=frame, timestamp=request.duration_seconds,
+                                actors=[], event_kind="phase_change",
+                            ).model_dump(),
+                            "phase": "encoding",
+                            "phase_detail": f"Encoding sensor video {done}/{total}",
+                            "progress": {"current": done, "total": total},
+                        },
+                    },
+                )
+            sensor_encode_results = encode_all_sensors(spawned_sensors, fps=fps_enc, max_workers=4, on_progress=_on_sensor_encode_progress)
+            _append_debug_log(debug_log, f"Sensor encoding complete.")
+            _put_message(
+                message_queue,
+                {
+                    "kind": "stream",
+                    "payload": {
+                        **SimulationStreamMessage(
+                            frame=frame,
+                            timestamp=request.duration_seconds,
+                            actors=[],
+                            event_kind="phase_change",
+                        ).model_dump(),
+                        "phase": "encoding_done",
+                        "phase_detail": "All videos encoded",
+                    },
+                },
+            )
+
         manifest = {
+
             "map_name": request.map_name,
             "selected_roads": [road.model_dump() for road in request.selected_roads],
             "actors": [actor.model_dump() for actor in request.actors],
@@ -1979,8 +2052,10 @@ def _simulation_worker(
             "saved_frame_count": saved_frame_count,
             "sensor_timeout_count": sensor_timeout_count,
             "last_sensor_frame": last_sensor_frame,
+            "sensor_outputs": {sid: str(path) if path else None for sid, path in sensor_encode_results.items()},
             "worker_error": worker_error,
             "skipped_actors": skipped_actors,
+            "sensor_labels": {s.id: s.label for s in request.sensors} if request.sensors else {},
         }
         (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         _append_debug_log(

@@ -236,7 +236,12 @@ async def push_job_event(job_id: str, request: StarletteRequest):
 @app.websocket("/api/jobs/{job_id}/stream")
 async def job_stream(job_id: str, websocket: WebSocket):
     await websocket.accept()
-    sent = 0
+    # Resume from client-specified event index to avoid replaying old events on reconnect
+    after_str = websocket.query_params.get("after", "0")
+    try:
+        sent = max(0, int(after_str))
+    except (ValueError, TypeError):
+        sent = 0
     try:
         while True:
             job = service.get_job(job_id)
@@ -246,7 +251,7 @@ async def job_stream(job_id: str, websocket: WebSocket):
             new_events = job.events[sent:]
             if new_events:
                 batch = [event.payload.model_dump() for event in new_events]
-                await websocket.send_json(batch)
+                await websocket.send_json({"events": batch, "next_index": sent + len(new_events)})
                 sent += len(new_events)
             # Terminate after all events sent for completed jobs
             if job.state.value in ("succeeded", "failed", "cancelled") and sent >= len(job.events):
@@ -295,6 +300,14 @@ async def job_recordings(job_id: str):
     recordings = service.list_recordings()
     matched = [r for r in recordings if r.run_id == job.run_id and job.run_id]
     return {"items": [item.model_dump() for item in matched]}
+
+
+
+@app.get("/api/recordings")
+async def list_all_recordings(source_run_id: str | None = None):
+    """List all recordings, optionally filtered by source_run_id (scenario ID)."""
+    recordings = service.list_recordings(source_run_id=source_run_id)
+    return {"items": [r.model_dump() for r in recordings]}
 
 # DEPRECATED: legacy path was /api/simulation/recordings/file
 @app.get("/api/recordings/file")

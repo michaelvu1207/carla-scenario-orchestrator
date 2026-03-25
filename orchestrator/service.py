@@ -6,7 +6,9 @@ import requests as _requests_lib
 import threading
 import uuid
 from pathlib import Path
+import json as _json
 
+from .simulation_db import create_simulation, update_simulation_status, create_artifact, get_workspace_for_scenario
 from .artifact_storage import ArtifactStorage, NullArtifactStorage, S3ArtifactStorage
 from .config import Settings
 from .models import (
@@ -167,6 +169,22 @@ class OrchestratorService:
         worker.start()
         current = self.store.get(job_id)
         assert current is not None
+
+        # Write simulation record to Aurora
+        try:
+            sim_id = create_simulation(
+                scenario_id=request.source_run_id or job_id,
+                workspace_id=None,
+                map_name=request.map_name,
+                orchestrator_job_id=job_id,
+                request_payload=request.model_dump(),
+            )
+            self.store.update(job_id, simulation_id=sim_id)
+            logger.info(f"Aurora simulation record created: {sim_id}")
+            # Store workspace for artifact creation later
+        except Exception as exc:
+            logger.warning(f"Failed to create Aurora simulation record (non-fatal): {exc}")
+
         return JobSubmissionResponse(job_id=job_id, state=current.state, queue_position=current.queue_position)
 
 
@@ -263,27 +281,56 @@ class OrchestratorService:
         for job in self.store.list():
             if not job.run_id:
                 continue
-            if not job.artifacts.recording_path:
-                continue
             if source_run_id and getattr(job.request, 'source_run_id', None) != source_run_id:
                 continue
-            # Find S3 URL for the MP4 if uploaded
-            s3_url: str | None = None
+
+            # Build S3 URL lookup from uploaded artifacts
+            s3_urls_by_label: dict[str, str] = {}
             for artifact in job.artifacts.uploaded_artifacts:
                 if artifact.kind == "MP4" and artifact.s3_key:
-                    s3_url = f"https://{artifact.s3_bucket}.s3.amazonaws.com/{artifact.s3_key}"
-                    break
-            items.append(
-                RecordingInfo(
-                    run_id=job.run_id,
-                    label=f"{job.request.map_name} ({job.job_id})",
-                    mp4_path=job.artifacts.recording_path,
-                    frames_path=None,
-                    created_at=job.updated_at.isoformat(),
-                    source_run_id=getattr(job.request, 'source_run_id', None),
-                    s3_url=s3_url,
+                    url = f"https://{artifact.s3_bucket}.s3.amazonaws.com/{artifact.s3_key}"
+                    key = artifact.label or "recording.mp4"
+                    s3_urls_by_label[key] = url
+
+            # Top-down recording (legacy single-camera path)
+            if job.artifacts.recording_path:
+                items.append(
+                    RecordingInfo(
+                        run_id=job.run_id,
+                        label=f"{job.request.map_name} ({job.job_id})",
+                        mp4_path=job.artifacts.recording_path,
+                        frames_path=None,
+                        created_at=job.updated_at.isoformat(),
+                        source_run_id=getattr(job.request, 'source_run_id', None),
+                        s3_url=s3_urls_by_label.get("recording.mp4"),
+                    )
                 )
-            )
+
+            # Per-sensor recordings from manifest
+            try:
+                manifest_path = Path(job.artifacts.output_dir) / job.run_id / "manifest.json"
+                if manifest_path.exists():
+                    manifest = _json.loads(manifest_path.read_text())
+                    sensor_outputs = manifest.get("sensor_outputs") or {}
+                    sensor_labels = manifest.get("sensor_labels") or {}
+                    for sensor_id, mp4_path in sensor_outputs.items():
+                        if not mp4_path:
+                            continue
+                        label = sensor_labels.get(sensor_id, sensor_id)
+                        items.append(
+                            RecordingInfo(
+                                run_id=job.run_id,
+                                label=label,
+                                mp4_path=mp4_path,
+                                frames_path=None,
+                                created_at=job.updated_at.isoformat(),
+                                source_run_id=getattr(job.request, 'source_run_id', None),
+                                s3_url=s3_urls_by_label.get(sensor_id),
+                            )
+                        )
+            except Exception:
+                pass  # manifest may not exist for old jobs
+
         items.sort(key=lambda item: item.created_at, reverse=True)
         return items
 
@@ -350,6 +397,19 @@ class OrchestratorService:
             log_excerpt=log_excerpt,
         )
 
+    def _send_phase(self, job_id: str, phase: str, detail: str, progress: dict | None = None) -> None:
+        """Send a phase transition event to the job's event stream."""
+        payload = SimulationStreamMessage(
+            frame=0, timestamp=0, actors=[], event_kind="phase_change",
+        )
+        data = payload.model_dump()
+        data["phase"] = phase
+        data["phase_detail"] = detail
+        if progress:
+            data["progress"] = progress
+        enriched = SimulationStreamMessage.model_validate(data)
+        self.store.append_event(job_id, enriched)
+
     def _run_job(self, job_id: str) -> None:
         self._ensure_runtime_pool_started()
         job = self.store.get(job_id)
@@ -357,6 +417,7 @@ class OrchestratorService:
             return
         with self._lock:
             cancel_event = self._cancel_events[job_id]
+        self._send_phase(job_id, "acquiring_gpu", "Waiting for available GPU slot")
         try:
             lease = self.scheduler.acquire(job_id, cancel_event, map_name=normalize_map_name(job.request.map_name))
         except RuntimeError as exc:
@@ -368,6 +429,8 @@ class OrchestratorService:
 
         self.store.update_queue_positions()
         self.store.update(job_id, state=JobState.starting, gpu=lease.to_model(), queue_position=0)
+        map_name = job.request.map_name
+        self._send_phase(job_id, "loading_map", f"Preparing {map_name} on GPU {lease.device_id}")
 
         runtime_spec = self._write_runtime_files(job, lease.to_model())
         self.store.update(job_id, container_name=lease.container_name)
@@ -422,6 +485,7 @@ class OrchestratorService:
                 run_id=result.run_id,
                 artifacts=local_artifacts,
             )
+            self._send_phase(job_id, "uploading", "Uploading artifacts to S3")
             uploaded_artifacts = self.artifact_storage.upload_job_artifacts(current)
             # S3-first: upload everything and delete local directory
             if hasattr(self.artifact_storage, 'upload_all_and_delete_local'):
@@ -436,9 +500,44 @@ class OrchestratorService:
                 run_id=result.run_id,
                 artifacts=final_artifacts,
             )
+
+            # Write artifacts + final status to Aurora
+            try:
+                sim_id = getattr(current, "simulation_id", None)
+                scenario_id = current.request.source_run_id or job_id
+                if sim_id and uploaded_artifacts:
+                    for art in uploaded_artifacts:
+                        create_artifact(
+                            simulation_id=sim_id,
+                            scenario_id=scenario_id,
+                            workspace_id=get_workspace_for_scenario(scenario_id) or "default",
+                            kind=art.kind,
+                            s3_bucket=art.s3_bucket or "",
+                            s3_key=art.s3_key or "",
+                            label=art.label,
+                            content_type=art.content_type,
+                            file_ext=art.file_ext,
+                            size_bytes=art.size_bytes,
+                            checksum_sha256=art.checksum_sha256,
+                        )
+                    status = "completed" if result.state.value == "succeeded" else result.state.value
+                    update_simulation_status(sim_id, status, backend_run_id=result.run_id, error_message=result.error)
+                    logger.info(f"Aurora: simulation {sim_id} -> {status}, {len(uploaded_artifacts)} artifacts")
+                elif sim_id:
+                    status = "completed" if result.state.value == "succeeded" else result.state.value
+                    update_simulation_status(sim_id, status, backend_run_id=result.run_id, error_message=result.error)
+            except Exception as exc:
+                logger.warning(f"Failed to update Aurora simulation (non-fatal): {exc}")
         except Exception as exc:  # noqa: BLE001
             final_state = JobState.cancelled if cancel_event.is_set() else JobState.failed
             self.store.update(job_id, state=final_state, error=str(exc))
+            # Update Aurora on failure
+            try:
+                failed_job = self.store.get(job_id)
+                if failed_job and failed_job.simulation_id:
+                    update_simulation_status(failed_job.simulation_id, final_state.value, error_message=str(exc))
+            except Exception:
+                pass
         finally:
             # Track which map the slot has loaded after job completion
             try:

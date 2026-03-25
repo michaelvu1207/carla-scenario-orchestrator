@@ -91,9 +91,8 @@ async def run_simulation_activity(input: dict) -> dict:
             self._batch.append(envelope)
             if len(self._batch) >= self._batch_size:
                 self._flush()
-            # Heartbeat Temporal periodically
-            if len(self._batch) % 10 == 0:
-                activity.heartbeat("frame")
+            # Heartbeat Temporal on every event to prevent timeout during encoding
+            activity.heartbeat("frame")
 
         def _flush(self) -> None:
             if not self._batch:
@@ -118,7 +117,19 @@ async def run_simulation_activity(input: dict) -> dict:
 
     stop_event = threading.Event()
     pause_event = threading.Event()
+    heartbeat_stop = threading.Event()
     collector = EventPusher()
+
+    # Background heartbeat thread — keeps activity alive during long encoding phases
+    def _heartbeat_loop():
+        while not heartbeat_stop.is_set():
+            try:
+                activity.heartbeat("alive")
+            except Exception:
+                pass
+            heartbeat_stop.wait(timeout=15)  # Heartbeat every 15s
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="heartbeat")
+    heartbeat_thread.start()
 
     def _run_sim():
         _simulation_worker(
@@ -130,6 +141,7 @@ async def run_simulation_activity(input: dict) -> dict:
             carla_client=_worker_carla_client,
         )
         collector.close()  # Flush remaining events
+        heartbeat_stop.set()
 
     # Import and run synchronously in thread (Temporal activities support sync)
     from .carla_runner.simulation_service import _simulation_worker
@@ -193,8 +205,8 @@ class SimulationWorkflow:
         return await workflow.execute_activity(
             run_simulation_activity,
             input,
-            start_to_close_timeout=timedelta(minutes=10),
-            heartbeat_timeout=timedelta(seconds=60),
+            start_to_close_timeout=timedelta(minutes=20),
+            heartbeat_timeout=timedelta(seconds=120),
             retry_policy=RetryPolicy(
                 initial_interval=timedelta(seconds=2),
                 maximum_attempts=2,  # 1 retry on failure
