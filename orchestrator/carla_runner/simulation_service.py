@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import asyncio
 import json
 import math
@@ -21,8 +22,51 @@ import base64
 import io
 from typing import Any
 
-from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, normalize_map_name
+from .dataset_repository import build_selected_roads, build_runtime_road_summaries, dataset_lane_type_counts, normalize_map_name, set_generated_map_cache
+
+def _resolve_parking_spawn(actor, world, runtime_segments_raw):
+    """If actor has a synthetic parking lane_id (not in runtime), compute world coords.
+    Returns a carla.Transform or None (if not a parking actor or resolution fails).
+    """
+    import math as _math
+    if not hasattr(actor, "spawn") or actor.spawn is None:
+        return None
+    if not hasattr(actor, "is_static") or not actor.is_static:
+        return None
+    if actor.placement_mode != "road":
+        return None
+
+    road_id = str(actor.spawn.road_id)
+    lane_id = actor.spawn.lane_id
+    s_fraction = actor.spawn.s_fraction or 0.5
+
+    if lane_id is None:
+        return None
+
+    # Check if this lane_id exists in runtime segments
+    runtime_has_lane = any(
+        str(seg.get("road_id", "")) == road_id and seg.get("lane_id") == lane_id
+        for seg in runtime_segments_raw
+    )
+    if runtime_has_lane:
+        return None  # Normal lane, let regular spawn handle it
+
+    # This is a synthetic parking lane_id — resolve to world coords
+    try:
+        from ..parking_resolver import compute_parking_position
+        side = "right" if lane_id < 0 else "left"
+        park_pos = compute_parking_position(runtime_segments_raw, road_id, s_fraction, side=side)
+        if park_pos:
+            import carla
+            location = carla.Location(x=park_pos["x"], y=-park_pos["y"], z=park_pos["z"])
+            rotation = carla.Rotation(yaw=park_pos["yaw"])
+            return carla.Transform(location, rotation)
+    except Exception:
+        pass
+    return None
+
 from .sensor_spawner import spawn_sensors, collect_sensor_frames, destroy_all_sensors
+from .gt_bbox import spawn_gt_sensors, collect_gt_frames, destroy_gt_sensors, extract_bboxes
 from .sensor_encoder import encode_all_sensors
 from .models import (
     ActorDraft,
@@ -38,6 +82,8 @@ from .models import (
     SimulationRunRequest,
     SimulationStreamMessage,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1082,6 +1128,7 @@ def _simulation_worker(
     original_settings = None
     tm = None
     frame = 0
+    step = 0
     ego_vehicle = None
     fallback_vehicle = None
     saved_frame_count = 0
@@ -1090,6 +1137,8 @@ def _simulation_worker(
     worker_error = None
     skipped_actors: list[dict[str, Any]] = []
     spawned_sensors = []  # Multi-sensor support
+    gt_spawned_sensors = []  # GT sensors (semantic_seg, depth, instance_seg)
+    gt_dir = run_dir / "gt"
     frame_writer_pool = ThreadPoolExecutor(max_workers=8)
     path_vehicle_targets: list[tuple[Any, Any, float]] = []
     timed_path_vehicle_targets: list[dict[str, Any]] = []
@@ -1124,6 +1173,20 @@ def _simulation_worker(
         _append_debug_log(debug_log, f"Map load: {_map_load_elapsed:.2f}s (loaded={_map_load_elapsed > 0.1})")
 
         world = client.get_world()
+
+        # Clean up leftover actors from previous runs
+        _stale = [a for a in world.get_actors().filter("vehicle.*")] + \
+                 [a for a in world.get_actors().filter("walker.*")] + \
+                 [a for a in world.get_actors().filter("controller.*")] + \
+                 [a for a in world.get_actors().filter("sensor.*")]
+        if _stale:
+            _append_debug_log(debug_log, f"Destroying {len(_stale)} leftover actors from previous run.")
+            for _a in _stale:
+                try:
+                    _a.destroy()
+                except Exception:
+                    pass
+            _append_debug_log(debug_log, "World cleanup complete.")
         original_settings = world.get_settings()
         sim_settings = world.get_settings()
         sim_settings.synchronous_mode = True
@@ -1218,9 +1281,20 @@ def _simulation_worker(
                             debug_log,
                             f"Spawn failed for {actor.label} at freeform point ({actor.spawn_point.x:.2f}, {actor.spawn_point.y:.2f}).",
                         )
-                        raise RuntimeError(
-                            f"Failed to spawn vehicle {actor.label} at ({actor.spawn_point.x:.1f}, {actor.spawn_point.y:.1f})."
+                        logger.warning(f"Skipping vehicle {actor.label} — failed to spawn at ({actor.spawn_point.x}, {actor.spawn_point.y})")
+                        _put_message(
+                            message_queue,
+                            {
+                                "kind": "stream",
+                                "payload": {
+                                    "frame": 0,
+                                    "timestamp": 0.0,
+                                    "actors": [],
+                                    "warning": f"Could not place {actor.label} at ({actor.spawn_point.x:.1f}, {actor.spawn_point.y:.1f}) — skipped",
+                                },
+                            },
                         )
+                        continue
                     if _should_skip_vehicle_spawn_failure(actor, static_road_vehicle_count):
                         skipped_actor = {
                             "id": actor.id,
@@ -1565,7 +1639,21 @@ def _simulation_worker(
             )
             _append_debug_log(debug_log, f"Spawned {len(spawned_sensors)} sensors successfully.")
 
+        # ── Spawn GT sensors ──
+        if request.gt_sensors:
+            _append_debug_log(debug_log, f"Spawning {len(request.gt_sensors)} GT sensors: {request.gt_sensors}")
+            gt_dir.mkdir(parents=True, exist_ok=True)
+            gt_spawned_sensors = spawn_gt_sensors(
+                world=world,
+                blueprint_library=blueprint_library,
+                gt_sensor_names=request.gt_sensors,
+                ego_vehicle=ego_vehicle,
+                gt_dir=gt_dir,
+            )
+            _append_debug_log(debug_log, f"Spawned {len(gt_spawned_sensors)} GT sensors.")
+
         max_steps = int(request.duration_seconds / request.fixed_delta_seconds)
+        step = 0
         for step in range(max_steps):
             if stop_event.is_set():
                 break
@@ -1908,9 +1996,43 @@ def _simulation_worker(
                     world.get_spectator().set_transform(sensor.get_transform())
                 except Exception:
                     pass
+            # Update tracking cameras to follow their target actors
+            if spawned_sensors:
+                for ss in spawned_sensors:
+                    if ss.config.tracking_target and ss.config.attach_to == "world":
+                        target = actor_label_map.get(ss.config.tracking_target)
+                        if target and target.is_alive:
+                            try:
+                                target_loc = target.get_transform().location
+                                cam_tf = ss.actor.get_transform()
+                                dx = target_loc.x - cam_tf.location.x
+                                dy = target_loc.y - cam_tf.location.y
+                                dz = target_loc.z - cam_tf.location.z
+                                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+                                if dist > 0.1:
+                                    import carla as _carla
+                                    yaw = math.degrees(math.atan2(dy, dx))
+                                    pitch = math.degrees(math.atan2(-dz, math.sqrt(dx * dx + dy * dy)))
+                                    cam_tf.rotation = _carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)
+                                    ss.actor.set_transform(cam_tf)
+                            except RuntimeError:
+                                pass  # actor destroyed mid-sim
+
             # Collect frames from all multi-sensor spawned sensors
             if spawned_sensors:
                 collect_sensor_frames(spawned_sensors, timeout=1.5)
+            # Collect GT sensor frames + extract bounding boxes
+            if gt_spawned_sensors:
+                _gt_collected = collect_gt_frames(gt_spawned_sensors, frame_num=frame, timeout=1.5)
+                # Use first GT sensor (semantic_seg preferred) for bbox projection
+                _ref_sensor = next((s for s in gt_spawned_sensors if s.sensor_type == "semantic_seg"), gt_spawned_sensors[0] if gt_spawned_sensors else None)
+                if _ref_sensor and _ref_sensor.actor and _ref_sensor.actor.is_alive:
+                    try:
+                        _all_actors = world.get_actors()
+                        _driveable = [a for a in _all_actors if a.type_id.startswith(("vehicle.", "walker."))]
+                        extract_bboxes(_driveable, _ref_sensor.actor, frame, gt_dir / "bbox")
+                    except Exception as _bbox_exc:
+                        _append_debug_log(debug_log, f"Bbox extraction error at frame {frame}: {_bbox_exc}")
             actor_states: list[dict[str, Any]] = []
             for actor_draft, handle in actors:
                 if not handle or not handle.is_alive:
@@ -2032,6 +2154,10 @@ def _simulation_worker(
         if spawned_sensors:
             _append_debug_log(debug_log, f"Destroying {len(spawned_sensors)} spawned sensors.")
             destroy_all_sensors(spawned_sensors)
+        # Destroy GT sensors
+        if gt_spawned_sensors:
+            _append_debug_log(debug_log, f"Destroying {len(gt_spawned_sensors)} GT sensors.")
+            destroy_gt_sensors(gt_spawned_sensors)
 
         if client is not None:
             destroy_handles: list[Any] = []
@@ -2198,6 +2324,9 @@ def _simulation_worker(
             "sensor_timeout_count": sensor_timeout_count,
             "last_sensor_frame": last_sensor_frame,
             "sensor_outputs": {sid: str(path) if path else None for sid, path in sensor_encode_results.items()},
+            "gt_enabled": bool(request.gt_sensors),
+            "gt_sensor_types": list(request.gt_sensors),
+            "gt_dir": str(gt_dir) if request.gt_sensors else None,
             "worker_error": worker_error,
             "skipped_actors": skipped_actors,
             "sensor_labels": {s.id: s.label for s in request.sensors} if request.sensors else {},
@@ -2452,7 +2581,15 @@ class CarlaSimulationService:
                         centerline=line,
                     )
                 )
-        road_summaries = build_runtime_road_summaries(map_name)
+        # Populate generated map cache for this worker process
+        from ..generated_map import build_generated_map as _build_gen_map
+        _xodr_text = world.get_map().to_opendrive()
+        _generated = _build_gen_map(normalized_map_name, _xodr_text)
+        set_generated_map_cache(normalized_map_name, _generated)
+        all_summaries = build_runtime_road_summaries(map_name)
+        # Filter to only roads that exist in CARLA runtime
+        _runtime_road_ids = {str(seg.road_id) for seg in segments}
+        road_summaries = [rs for rs in all_summaries if rs.id in _runtime_road_ids]
         dataset_counts = dataset_lane_type_counts(map_name)
         return RuntimeMapResponse(
             map_name=map_name,

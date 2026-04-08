@@ -11,8 +11,11 @@ from typing import Any, Callable
 from .carla_runner.dataset_repository import (
     build_runtime_road_summaries,
     dataset_lane_type_counts,
+    list_supported_maps,
     normalize_map_name,
+    set_generated_map_cache,
 )
+from .road_corridors import build_corridors, build_corridor_lookup
 from .carla_runner.models import (
     CarlaMapInfo,
     CarlaStatusResponse,
@@ -127,6 +130,7 @@ class CarlaMetadataService:
         self._runtime_map_cache: dict[str, RuntimeMapResponse] = {}
         self._map_xodr_cache: dict[str, str] = {}
         self._generated_map_cache: dict[str, dict[str, Any]] = {}
+        self._corridor_cache: dict[str, list] = {}
         self._last_xodr_map_name: str | None = None
         # Track which map was last requested (for implicit map context)
         self._current_map_name: str | None = None
@@ -214,10 +218,16 @@ class CarlaMetadataService:
         try:
             client = self._client()
             world = client.get_world()
-            current_map = world.get_map().name
+            try:
+                current_map = world.get_map().name
+            except RuntimeError:
+                current_map = None
+            supported = set(list_supported_maps())
             available = []
             for item in client.get_available_maps():
                 normalized = normalize_map_name(item)
+                if normalized not in supported:
+                    continue
                 available.append(
                     CarlaMapInfo(
                         name=item,
@@ -256,10 +266,13 @@ class CarlaMetadataService:
         # Try to find a slot that already has this map
         client = self._client(map_name=normalized)
         world = client.get_world()
-        current = world.get_map().name
+        try:
+            current = world.get_map().name
+            needs_load = normalize_map_name(current) != normalized
+        except RuntimeError:
+            needs_load = True
 
-        if normalize_map_name(current) != normalized:
-            # The resolved slot doesn't have this map — need to load it
+        if needs_load:
             client.load_world(map_name)
             time.sleep(1.0)
 
@@ -333,7 +346,12 @@ class CarlaMetadataService:
                         centerline=line,
                     )
                 )
-        road_summaries = build_runtime_road_summaries(map_name)
+        # Ensure generated map cache is populated before building summaries
+        self.get_generated_map(force_refresh=False)
+        all_summaries = build_runtime_road_summaries(map_name)
+        # Filter to only roads that exist in CARLA runtime
+        runtime_road_ids = {str(seg.road_id) for seg in segments}
+        road_summaries = [rs for rs in all_summaries if rs.id in runtime_road_ids]
         dataset_counts = dataset_lane_type_counts(map_name)
         runtime_map = RuntimeMapResponse(
             map_name=map_name,
@@ -404,6 +422,32 @@ class CarlaMetadataService:
         with self._lock:
             self._generated_map_cache[normalized_map_name] = generated_map
             self._last_xodr_map_name = normalized_map_name
+        set_generated_map_cache(normalized_map_name, generated_map)
+        # Build road corridors from xodr
+        try:
+            from .road_corridors import build_corridors
+            corridors = build_corridors(xodr_text)
+            generated_map["corridors"] = [
+                {
+                    "id": c.id,
+                    "road_ids": c.road_ids,
+                    "junction_ids": c.junction_ids,
+                    "total_length": round(c.total_length, 1),
+                    "segment_lengths": [round(sl, 1) for sl in c.segment_lengths],
+                    "segment_offsets": [round(so, 1) for so in c.segment_offsets],
+                    "has_parking": c.has_parking,
+                    "lane_config": c.lane_config,
+                    "bearing_deg": c.bearing_deg,
+                    "description": c.description,
+                    "road_count": len(c.road_ids),
+                }
+                for c in corridors
+            ]
+            with self._lock:
+                self._corridor_cache[normalized_map_name] = corridors
+        except Exception as exc:
+            logger.warning("Failed to build corridors: %s", exc)
+            generated_map["corridors"] = []
         return copy.deepcopy(generated_map)
 
     def get_generated_map_with_runtime(self, force_refresh: bool = False) -> dict[str, object]:
@@ -417,6 +461,45 @@ class CarlaMetadataService:
                 "road_segments": [seg.model_dump() for seg in runtime.road_segments],
                 "road_summaries": [rs.model_dump() for rs in runtime.road_summaries],
             }
+            # Filter corridors to only include roads that exist in CARLA runtime
+            rt_ids = {str(seg.road_id) for seg in runtime.road_segments}
+            corridors = generated.get("corridors", [])
+            filtered = [
+                c for c in corridors
+                if all(rid in rt_ids for rid in c["road_ids"])
+            ]
+            # Build RoadCorridor objects from filtered dicts
+            from .road_corridors import RoadCorridor, adjust_corridors_for_junction_gaps
+            filtered_objs = []
+            for cd in filtered:
+                filtered_objs.append(RoadCorridor(
+                    id=cd["id"], road_ids=cd["road_ids"], junction_ids=cd.get("junction_ids", []),
+                    total_length=cd["total_length"], segment_lengths=cd["segment_lengths"],
+                    segment_offsets=cd["segment_offsets"], has_parking=cd["has_parking"],
+                    lane_config=cd["lane_config"], bearing_deg=cd["bearing_deg"],
+                    description=cd["description"],
+                ))
+            # Adjust corridor distances to include physical junction gaps
+            rt_segments = [seg.model_dump() for seg in runtime.road_segments]
+            adjusted_objs = adjust_corridors_for_junction_gaps(filtered_objs, rt_segments)
+            # Serialize adjusted corridors for API response
+            generated["corridors"] = [
+                {
+                    "id": ac.id, "road_ids": ac.road_ids, "junction_ids": ac.junction_ids,
+                    "total_length": ac.total_length,
+                    "segment_lengths": [round(sl, 1) for sl in ac.segment_lengths],
+                    "segment_offsets": [round(so, 1) for so in ac.segment_offsets],
+                    "has_parking": ac.has_parking, "lane_config": ac.lane_config,
+                    "bearing_deg": ac.bearing_deg, "description": ac.description,
+                    "road_count": len(ac.road_ids),
+                }
+                for ac in adjusted_objs
+            ]
+            # Cache adjusted corridors for scene assistant
+            normalized = generated.get("name", "")
+            if normalized:
+                with self._lock:
+                    self._corridor_cache[normalized] = adjusted_objs
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to merge runtime map data into generated map: %s", exc)
             generated["runtime"] = None
@@ -439,3 +522,185 @@ class CarlaMetadataService:
         with self._lock:
             self._blueprints_cache = blueprints
         return {kind: list(items) for kind, items in blueprints.items()}
+
+    def get_street_furniture(self, force_refresh: bool = False) -> dict[str, Any]:
+        """Return streetlight poles and traffic light positions for the current map."""
+        target_map = self._current_map_name
+        cache_key = f"street_furniture_{target_map}"
+        if not force_refresh:
+            with self._lock:
+                cached = getattr(self, "_street_furniture_cache", {}).get(cache_key)
+            if cached is not None:
+                return copy.deepcopy(cached)
+
+        client = self._client(map_name=target_map)
+        world = client.get_world()
+        carla = _require_carla()
+
+        result: dict[str, Any] = {"poles": [], "traffic_lights": []}
+
+        # Get pole environment objects (includes streetlights)
+        try:
+            poles = world.get_environment_objects(carla.CityObjectLabel.Poles)
+            for obj in poles:
+                t = obj.transform
+                coords = _carla_to_frontend(t.location, t.rotation)
+                result["poles"].append({
+                    "id": obj.id,
+                    "name": obj.name,
+                    **coords,
+                })
+        except Exception as exc:
+            logger.warning("Failed to get poles: %s", exc)
+
+        # Get traffic light actors (richer API with stop waypoints)
+        try:
+            for tl in world.get_actors().filter("traffic.traffic_light"):
+                t = tl.get_transform()
+                coords = _carla_to_frontend(t.location, t.rotation)
+                stop_wps = []
+                try:
+                    for wp in tl.get_stop_waypoints():
+                        wc = _carla_to_frontend(wp.transform.location, wp.transform.rotation)
+                        stop_wps.append(wc)
+                except Exception:
+                    pass
+                result["traffic_lights"].append({
+                    "actor_id": tl.id,
+                    "type_id": tl.type_id,
+                    **coords,
+                    "pole_index": tl.get_pole_index(),
+                    "opendrive_id": tl.get_opendrive_id(),
+                    "stop_waypoints": stop_wps,
+                })
+        except Exception as exc:
+            logger.warning("Failed to get traffic lights: %s", exc)
+
+        with self._lock:
+            if not hasattr(self, "_street_furniture_cache"):
+                self._street_furniture_cache: dict[str, Any] = {}
+            self._street_furniture_cache[cache_key] = result
+        return copy.deepcopy(result)
+
+    def set_weather(self, weather_params: dict) -> dict[str, Any]:
+        """Set weather parameters on the CARLA world."""
+        carla = _require_carla()
+        client = self._client()
+        world = client.get_world()
+        weather = world.get_weather()
+
+        param_map = {
+            'cloudiness': 'cloudiness',
+            'precipitation': 'precipitation',
+            'precipitation_deposits': 'precipitation_deposits',
+            'wind_intensity': 'wind_intensity',
+            'fog_density': 'fog_density',
+            'fog_distance': 'fog_distance',
+            'sun_altitude_angle': 'sun_altitude_angle',
+            'sun_azimuth_angle': 'sun_azimuth_angle',
+        }
+        applied = {}
+        for key, attr in param_map.items():
+            if key in weather_params and weather_params[key] is not None:
+                value = float(weather_params[key])
+                setattr(weather, attr, value)
+                applied[key] = value
+
+        world.set_weather(weather)
+        return {
+            'status': 'ok',
+            'applied': applied,
+            'current_weather': {
+                'cloudiness': weather.cloudiness,
+                'precipitation': weather.precipitation,
+                'precipitation_deposits': weather.precipitation_deposits,
+                'wind_intensity': weather.wind_intensity,
+                'fog_density': weather.fog_density,
+                'fog_distance': weather.fog_distance,
+                'sun_altitude_angle': weather.sun_altitude_angle,
+                'sun_azimuth_angle': weather.sun_azimuth_angle,
+            },
+        }
+
+    def set_traffic_light_state(self, traffic_light_id: int, state: str, duration_seconds: float | None = None) -> dict[str, Any]:
+        """Set a specific traffic light to a given state (red/yellow/green). Freezes all lights first."""
+        carla = _require_carla()
+        client = self._client()
+        world = client.get_world()
+
+        state_map = {
+            'red': carla.TrafficLightState.Red,
+            'yellow': carla.TrafficLightState.Yellow,
+            'green': carla.TrafficLightState.Green,
+        }
+        carla_state = state_map.get(state.lower())
+        if carla_state is None:
+            raise ValueError(f"Invalid traffic light state: {state}. Must be red, yellow, or green.")
+
+        # Find the target traffic light
+        target_tl = None
+        for tl in world.get_actors().filter('traffic.traffic_light'):
+            if tl.id == traffic_light_id:
+                target_tl = tl
+                break
+
+        if target_tl is None:
+            raise ValueError(f"Traffic light with id {traffic_light_id} not found.")
+
+        # Freeze all traffic lights first
+        for tl in world.get_actors().filter('traffic.traffic_light'):
+            tl.freeze(True)
+
+        # Set desired state
+        target_tl.set_state(carla_state)
+        if duration_seconds is not None:
+            target_tl.set_green_time(duration_seconds if state == 'green' else 0.0)
+            target_tl.set_red_time(duration_seconds if state == 'red' else 0.0)
+            target_tl.set_yellow_time(duration_seconds if state == 'yellow' else 0.0)
+
+        t = target_tl.get_transform()
+        coords = _carla_to_frontend(t.location, t.rotation)
+        return {
+            'status': 'ok',
+            'traffic_light_id': traffic_light_id,
+            'state': state.lower(),
+            'frozen': True,
+            'duration_seconds': duration_seconds,
+            **coords,
+        }
+
+    def road_position_to_world(self, road_id: int, s_fraction: float, lane_id: int) -> dict[str, Any]:
+        """Convert (road_id, s_fraction, lane_id) to world (x, y, yaw) using CARLA waypoints."""
+        client = self._client()
+        world = client.get_world()
+        carla_map = world.get_map()
+
+        # Get all waypoints for the road and lane
+        all_waypoints = carla_map.generate_waypoints(1.0)
+        road_waypoints = [
+            wp for wp in all_waypoints
+            if int(wp.road_id) == road_id and int(wp.lane_id) == lane_id
+        ]
+
+        if not road_waypoints:
+            raise ValueError(f"No waypoints found for road_id={road_id}, lane_id={lane_id}")
+
+        # Sort by s value
+        road_waypoints.sort(key=lambda wp: wp.s)
+
+        # Interpolate by s_fraction
+        total_length = road_waypoints[-1].s - road_waypoints[0].s
+        if total_length <= 0:
+            wp = road_waypoints[0]
+        else:
+            target_s = road_waypoints[0].s + s_fraction * total_length
+            # Find closest waypoint
+            wp = min(road_waypoints, key=lambda w: abs(w.s - target_s))
+
+        coords = _carla_to_frontend(wp.transform.location, wp.transform.rotation)
+        return {
+            'road_id': road_id,
+            's_fraction': s_fraction,
+            'lane_id': lane_id,
+            **coords,
+        }

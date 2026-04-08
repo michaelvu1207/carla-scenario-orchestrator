@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import json
-from functools import lru_cache
-from pathlib import Path
+import logging
 from typing import Any
 
 from .models import RuntimeRoadSectionSummary, RuntimeRoadSummary, SelectedRoad
 
+logger = logging.getLogger(__name__)
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_DATASET_PATH = REPO_ROOT / "data" / "maps.generated.json"
+# ---------------------------------------------------------------------------
+# Module-level generated map cache (replaces static maps.generated.json)
+# ---------------------------------------------------------------------------
+_generated_map_cache: dict[str, dict[str, Any]] = {}
 
 
 def normalize_map_name(value: str | None) -> str:
@@ -21,33 +22,35 @@ def normalize_map_name(value: str | None) -> str:
     return normalized
 
 
-@lru_cache(maxsize=1)
-def _load_dataset() -> dict[str, Any]:
-    with DEFAULT_DATASET_PATH.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+def set_generated_map_cache(map_name: str, generated_map: dict[str, Any]) -> None:
+    key = normalize_map_name(map_name)
+    if not key:
+        return
+    _generated_map_cache[key] = generated_map
+    logger.debug("set_generated_map_cache: cached %s (%d roads)", key, len(generated_map.get("roads", [])))
+
+
+def _get_generated_roads(map_name: str) -> list[dict[str, Any]]:
+    cached = _generated_map_cache.get(normalize_map_name(map_name))
+    return cached.get("roads", []) if cached else []
+
+
+def _get_generated_stats(map_name: str) -> dict[str, Any]:
+    cached = _generated_map_cache.get(normalize_map_name(map_name))
+    return cached.get("stats", {}) if cached else {}
 
 
 def list_supported_maps() -> list[str]:
-    dataset = _load_dataset()
-    return [normalize_map_name(item.get("name")) for item in dataset.get("maps", [])]
-
-
-def find_map_record(map_name: str) -> dict[str, Any] | None:
-    target = normalize_map_name(map_name)
-    dataset = _load_dataset()
-    for item in dataset.get("maps", []):
-        if normalize_map_name(item.get("name")) == target:
-            return item
-    return None
+    return sorted(_generated_map_cache.keys())
 
 
 def build_selected_roads(map_name: str, road_ids: list[str]) -> list[SelectedRoad]:
-    map_record = find_map_record(map_name)
-    if not map_record:
+    roads_data = _get_generated_roads(map_name)
+    if not roads_data:
         return []
     wanted = {str(road_id) for road_id in road_ids}
     roads: list[SelectedRoad] = []
-    for road in map_record.get("roads", []):
+    for road in roads_data:
         if str(road.get("id")) not in wanted:
             continue
         roads.append(
@@ -63,12 +66,12 @@ def build_selected_roads(map_name: str, road_ids: list[str]) -> list[SelectedRoa
 
 
 def build_runtime_road_summaries(map_name: str) -> list[RuntimeRoadSummary]:
-    map_record = find_map_record(map_name)
-    if not map_record:
+    roads_data = _get_generated_roads(map_name)
+    if not roads_data:
         return []
 
     summaries: list[RuntimeRoadSummary] = []
-    for road in map_record.get("roads", []):
+    for road in roads_data:
         section_summaries = [
             RuntimeRoadSectionSummary(
                 index=int(section.get("index") or 0),
@@ -109,10 +112,7 @@ def build_runtime_road_summaries(map_name: str) -> list[RuntimeRoadSummary]:
 
 
 def dataset_lane_type_counts(map_name: str) -> dict[str, int]:
-    map_record = find_map_record(map_name)
-    if not map_record:
-        return {}
-    stats = map_record.get("stats", {})
+    stats = _get_generated_stats(map_name)
     counts = stats.get("laneTypes", {})
     return {str(key): int(value) for key, value in counts.items()}
 
@@ -230,30 +230,48 @@ def _road_matches_filters(
     return True, matching_sections or _road_sections_for_search(road)
 
 
-def _road_search_result(map_record: dict[str, Any], road: dict[str, Any], matching_sections: list[dict[str, Any]]) -> dict[str, Any]:
+def _road_search_result(map_name: str, road: dict[str, Any], matching_sections: list[dict[str, Any]]) -> dict[str, Any]:
+    # Build lane info from sections so the LLM can place actors without calling get_road
+    sections_with_lanes = []
+    suggested_spawn = None
+    for section in matching_sections:
+        section_idx = int(section.get("index") or 0)
+        driving_right = int(section.get("drivingRight") or 0)
+        driving_left = int(section.get("drivingLeft") or 0)
+        parking_right = int(section.get("parkingRight") or 0)
+        parking_left = int(section.get("parkingLeft") or 0)
+        # Driving lanes: negative IDs go right, positive go left (OpenDRIVE convention)
+        driving_lane_ids = [-(i + 1) for i in range(driving_right)] + [(i + 1) for i in range(driving_left)]
+        parking_lane_ids = []
+        if parking_right > 0:
+            parking_lane_ids.append(-(driving_right + 1))
+        if parking_left > 0:
+            parking_lane_ids.append(driving_left + 1)
+        sections_with_lanes.append({
+            "section_id": section_idx,
+            "label": str(section.get("label") or ""),
+            "driving_lanes": driving_lane_ids,
+            "parking_lanes": parking_lane_ids,
+            "total_driving": int(section.get("totalDriving") or 0),
+            "tags": [str(tag) for tag in section.get("tags", [])],
+        })
+        # Suggest the first driving lane at mid-road as default spawn
+        if suggested_spawn is None and driving_lane_ids:
+            suggested_spawn = {
+                "road_id": str(road.get("id")),
+                "section_id": section_idx,
+                "lane_id": driving_lane_ids[0],
+                "s_fraction": 0.3,
+            }
     return {
-        "map_name": normalize_map_name(map_record.get("name")),
+        "map_name": normalize_map_name(map_name),
         "road_id": str(road.get("id")),
         "name": str(road.get("name") or f"Road {road.get('id')}"),
         "length": float(road.get("length") or 0.0),
         "is_intersection": bool(road.get("isIntersection")),
         "tags": [str(tag) for tag in road.get("tags", [])],
-        "lane_types": sorted(_road_lane_types(road)),
-        "matching_sections": [
-            {
-                "index": int(section.get("index") or 0),
-                "label": str(section.get("label") or ""),
-                "s": float(section.get("s") or 0.0),
-                "driving_left": int(section.get("drivingLeft") or 0),
-                "driving_right": int(section.get("drivingRight") or 0),
-                "parking_left": int(section.get("parkingLeft") or 0),
-                "parking_right": int(section.get("parkingRight") or 0),
-                "total_driving": int(section.get("totalDriving") or 0),
-                "lane_types": [str(lane_type) for lane_type in section.get("laneTypes", [])],
-                "tags": [str(tag) for tag in section.get("tags", [])],
-            }
-            for section in matching_sections
-        ],
+        "sections": sections_with_lanes,
+        "suggested_spawn": suggested_spawn,
     }
 
 
@@ -271,13 +289,17 @@ def search_roads(
     parking_left_min: int | None = None,
     parking_right_min: int | None = None,
     require_parking_on_both_sides: bool | None = None,
-    limit: int = 12,
+    limit: int = 5,
+    runtime_road_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    map_record = find_map_record(map_name)
-    if not map_record:
+    roads_data = _get_generated_roads(map_name)
+    if not roads_data:
         return []
     results: list[dict[str, Any]] = []
-    for road in map_record.get("roads", []):
+    for road in roads_data:
+        # Skip roads not present in CARLA runtime (phantom roads)
+        if runtime_road_ids is not None and str(road.get("id")) not in runtime_road_ids:
+            continue
         matches, matching_sections = _road_matches_filters(
             road,
             query=query,
@@ -294,60 +316,9 @@ def search_roads(
         )
         if not matches:
             continue
-        results.append(_road_search_result(map_record, road, matching_sections))
+        results.append(_road_search_result(map_name, road, matching_sections))
         if len(results) >= max(1, limit):
             break
     return results
 
 
-def search_maps_by_road(
-    *,
-    query: str = "",
-    tags: list[str] | None = None,
-    lane_types: list[str] | None = None,
-    is_intersection: bool | None = None,
-    has_parking: bool | None = None,
-    driving_left: int | None = None,
-    driving_right: int | None = None,
-    total_driving: int | None = None,
-    parking_left_min: int | None = None,
-    parking_right_min: int | None = None,
-    require_parking_on_both_sides: bool | None = None,
-    map_limit: int = 8,
-    roads_per_map_limit: int = 5,
-) -> list[dict[str, Any]]:
-    dataset = _load_dataset()
-    results: list[dict[str, Any]] = []
-    for map_record in dataset.get("maps", []):
-        road_hits: list[dict[str, Any]] = []
-        for road in map_record.get("roads", []):
-            matches, matching_sections = _road_matches_filters(
-                road,
-                query=query,
-                tags=tags,
-                lane_types=lane_types,
-                is_intersection=is_intersection,
-                has_parking=has_parking,
-                driving_left=driving_left,
-                driving_right=driving_right,
-                total_driving=total_driving,
-                parking_left_min=parking_left_min,
-                parking_right_min=parking_right_min,
-                require_parking_on_both_sides=require_parking_on_both_sides,
-            )
-            if not matches:
-                continue
-            road_hits.append(_road_search_result(map_record, road, matching_sections))
-            if len(road_hits) >= max(1, roads_per_map_limit):
-                break
-        if road_hits:
-            results.append(
-                {
-                    "map_name": normalize_map_name(map_record.get("name")),
-                    "road_count": len(road_hits),
-                    "roads": road_hits,
-                }
-            )
-            if len(results) >= max(1, map_limit):
-                break
-    return results

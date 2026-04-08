@@ -9,7 +9,7 @@ from copy import deepcopy
 from textwrap import dedent
 from typing import Any
 
-import boto3
+import anthropic
 from pydantic import BaseModel, Field
 
 from .langchain_support import (
@@ -26,7 +26,7 @@ from .langchain_support import (
 )
 
 from ..carla_runner.dataset_repository import build_selected_roads
-from ..carla_runner.dataset_repository import search_maps_by_road as dataset_search_maps_by_road
+from ..road_corridors import build_corridor_lookup, resolve_corridor_distance, parse_lane_spec
 from ..carla_runner.dataset_repository import search_roads as dataset_search_roads
 from ..carla_runner.models import (
     ActorDraft,
@@ -41,16 +41,6 @@ from ..carla_runner.models import (
     SimulationActorState,
 )
 
-
-DEFAULT_MODEL_CANDIDATES = [
-    os.environ.get("BEDROCK_MODEL_ID", "").strip(),
-    "us.anthropic.claude-sonnet-4-6",
-    "anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-20250514-v1:0",
-    "anthropic.claude-sonnet-4-20250514-v1:0",
-    "us.anthropic.claude-3-7-sonnet-20250219-v1:0",
-    "anthropic.claude-3-7-sonnet-20250219-v1:0",
-]
 
 DEFAULT_VEHICLE_BLUEPRINT = "vehicle.tesla.model3"
 DEFAULT_WALKER_BLUEPRINT = "walker.pedestrian.0001"
@@ -83,7 +73,50 @@ class SceneAssistantApplyEditsInput(BaseModel):
     operations: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class SceneAssistantFindRoadsInput(BaseModel):
+
+class InspectStreetInput(BaseModel):
+    ref: str = Field(default="", description="A road_id, actor_id, or corridor_id to look up.")
+
+
+class FindStreetsInput(BaseModel):
+    query: str = Field(default="", description="Free text search (road name, tags)")
+    tags: list[str] = Field(default_factory=list)
+    lane_types: list[str] = Field(default_factory=list)
+    is_intersection: bool | None = None
+    has_parking: bool | None = None
+    driving_left: int | None = None
+    driving_right: int | None = None
+    total_driving: int | None = None
+    parking_left_min: int | None = None
+    parking_right_min: int | None = None
+    require_parking_on_both_sides: bool | None = None
+    limit: int = 5
+
+
+class InspectActorInput(BaseModel):
+    ref: str = Field(default="", description="Actor id or label.")
+
+
+class EditSceneInput(BaseModel):
+    operations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ManageScenarioInput(BaseModel):
+    action: str = Field(description="One of: list, read, create, duplicate, rename, delete, switch")
+    scenario_id: str | None = None
+    name: str | None = None
+    source_scenario_id: str | None = None
+
+
+class RunSimulationInput(BaseModel):
+    weather: dict[str, Any] | None = Field(default=None, description="Weather preset name or params dict")
+    traffic_lights: list[dict[str, Any]] | None = Field(default=None, description="Traffic light overrides")
+    duration_seconds: int | None = None
+    record: bool = True
+
+
+class SceneAssistantSearchRoadsInput(BaseModel):
+    scope: str = Field(default="current_map", description="Search scope: 'current_map' or 'all_maps'")
     query: str = ""
     tags: list[str] = Field(default_factory=list)
     lane_types: list[str] = Field(default_factory=list)
@@ -95,27 +128,87 @@ class SceneAssistantFindRoadsInput(BaseModel):
     parking_left_min: int | None = None
     parking_right_min: int | None = None
     require_parking_on_both_sides: bool | None = None
-    limit: int = Field(default=12, ge=1, le=50)
-
-
-class SceneAssistantSearchMapsByRoadInput(BaseModel):
-    query: str = ""
-    tags: list[str] = Field(default_factory=list)
-    lane_types: list[str] = Field(default_factory=list)
-    is_intersection: bool | None = None
-    has_parking: bool | None = None
-    driving_left: int | None = None
-    driving_right: int | None = None
-    total_driving: int | None = None
-    parking_left_min: int | None = None
-    parking_right_min: int | None = None
-    require_parking_on_both_sides: bool | None = None
-    map_limit: int = Field(default=8, ge=1, le=20)
-    roads_per_map_limit: int = Field(default=5, ge=1, le=20)
+    limit: int = 12
 
 
 class SceneAssistantSwitchMapInput(BaseModel):
     map_name: str
+
+
+class SceneAssistantGetCorridorsInput(BaseModel):
+    pass
+
+
+class SceneAssistantGetStreetContextInput(BaseModel):
+    ref: str = Field(default="", description="A road_id or actor_id to look up the street for.")
+
+
+class SceneAssistantGetMapContextInput(BaseModel):
+    carla_map_name: str = Field(default="", description="CARLA map name. Leave empty for the current map.")
+
+
+class SceneAssistantSetWeatherInput(BaseModel):
+    cloudiness: float | None = Field(default=None, ge=0.0, le=100.0, description="Cloud coverage 0-100")
+    precipitation: float | None = Field(default=None, ge=0.0, le=100.0, description="Rain intensity 0-100")
+    precipitation_deposits: float | None = Field(default=None, ge=0.0, le=100.0, description="Puddles on ground 0-100")
+    wind_intensity: float | None = Field(default=None, ge=0.0, le=100.0, description="Wind strength 0-100")
+    fog_density: float | None = Field(default=None, ge=0.0, le=100.0, description="Fog density 0-100")
+    fog_distance: float | None = Field(default=None, ge=0.0, le=500.0, description="Fog start distance in meters")
+    sun_altitude_angle: float | None = Field(default=None, ge=-90.0, le=90.0, description="Sun elevation: -90 midnight, 0 horizon, 90 noon")
+    sun_azimuth_angle: float | None = Field(default=None, ge=0.0, le=360.0, description="Sun compass bearing 0-360")
+
+
+class SceneAssistantGetStreetFurnitureInput(BaseModel):
+    pass
+
+
+class SceneAssistantSetTrafficLightStateInput(BaseModel):
+    traffic_light_id: int = Field(description="CARLA actor id of the traffic light")
+    state: str = Field(description="Desired state: red, yellow, or green")
+    duration_seconds: float | None = Field(default=None, ge=0.0, le=300.0, description="How long to hold this state")
+
+
+class SceneAssistantRoadPositionToWorldInput(BaseModel):
+    road_id: int = Field(description="OpenDRIVE road id")
+    s_fraction: float = Field(ge=0.0, le=1.0, description="Position along road 0.0-1.0")
+    lane_id: int = Field(description="OpenDRIVE lane id")
+
+
+class SceneAssistantListDatasetScenariosInput(BaseModel):
+    pass
+
+
+class SceneAssistantReadScenarioInput(BaseModel):
+    scenario_id: str = Field(description="Scenario ID to read")
+
+
+class SceneAssistantCreateScenarioInput(BaseModel):
+    display_name: str = Field(description="Name for the new scenario")
+    map_name: str = Field(default="", description="CARLA map name (defaults to current map)")
+
+
+class SceneAssistantDuplicateScenarioInput(BaseModel):
+    source_scenario_id: str = Field(description="ID of the scenario to copy")
+    new_name: str = Field(description="Display name for the copy")
+
+
+class SceneAssistantRenameScenarioInput(BaseModel):
+    scenario_id: str
+    new_name: str
+
+
+class SceneAssistantDeleteScenarioInput(BaseModel):
+    scenario_id: str
+
+
+class SceneAssistantSwitchActiveScenarioInput(BaseModel):
+    scenario_id: str = Field(description="Scenario ID to switch to")
+    reason: str = Field(default="", description="Why switching")
+
+
+class SceneAssistantRunSimulationInput(BaseModel):
+    duration_seconds: float = Field(default=10.0, ge=1.0, le=120.0, description="Duration in seconds")
+
 
 
 def _project_point_to_line_segment(
@@ -164,6 +257,13 @@ class SceneEditorState:
             for item in request.live_actors
         }
         self.selected_actor_id = request.selected_actor_id
+        self.corridors = []
+        self.corridors_by_id = {}
+        self.road_to_corridor = {}
+        self.callback_url = request.callback_url
+        self.callback_auth = request.callback_auth
+        self.dataset_id = request.dataset_id
+        self.switch_to_scenario_id: str | None = None
         self._rebuild_runtime_indexes()
 
     def _rebuild_runtime_indexes(self) -> None:
@@ -187,6 +287,114 @@ class SceneEditorState:
         self.selected_actor_id = None
         self._rebuild_runtime_indexes()
 
+
+    def set_corridors(self, corridors_data: list) -> None:
+        from ..road_corridors import RoadCorridor
+        self.corridors = corridors_data
+        self.corridors_by_id = {}
+        self.road_to_corridor = {}
+        for cd in corridors_data:
+            cid = cd.id if hasattr(cd, "id") else cd.get("id", "")
+            rids = cd.road_ids if hasattr(cd, "road_ids") else cd.get("road_ids", [])
+            self.corridors_by_id[cid] = cd
+            for rid in rids:
+                self.road_to_corridor[str(rid)] = cid
+
+    def get_corridors_summary(self) -> dict:
+        results = []
+        for cd in self.corridors:
+            if hasattr(cd, "id"):
+                results.append({"id": cd.id, "description": cd.description, "total_length_m": round(cd.total_length, 1), "road_count": len(cd.road_ids), "road_ids": cd.road_ids, "has_parking": cd.has_parking, "lane_config": cd.lane_config})
+            else:
+                results.append({"id": cd["id"], "description": cd.get("description", ""), "total_length_m": cd.get("total_length", 0), "road_count": cd.get("road_count", 1), "road_ids": cd.get("road_ids", []), "has_parking": cd.get("has_parking", False), "lane_config": cd.get("lane_config", "")})
+        multi = sum(1 for r in results if r["road_count"] > 1)
+        return {"total_corridors": len(results), "multi_road_corridors": multi, "corridors": results}
+
+    def _get_corridor_attr(self, cd, attr, default=None):
+        return getattr(cd, attr, None) if hasattr(cd, attr) else cd.get(attr, default)
+
+    def get_street_context(self, ref: str) -> dict:
+        road_id = None
+        for actor in self.actors:
+            if actor.id == ref or actor.label.lower() == ref.lower():
+                if actor.spawn and actor.spawn.road_id:
+                    road_id = str(actor.spawn.road_id)
+                break
+        if road_id is None:
+            road_id = str(ref)
+        corridor_id = self.road_to_corridor.get(road_id)
+        if not corridor_id:
+            return {"street": {"id": "road-" + road_id, "description": "Single road segment", "total_length_m": 0, "segments": [{"road_id": road_id, "length_m": 0, "start_m": 0, "lanes": self._get_lanes_for_road(road_id)}]}, "connected_streets": [], "actors_on_street": self._actors_on_roads([road_id]), "placement_hint": "Single road segment."}
+        cd = self.corridors_by_id.get(corridor_id)
+        if not cd:
+            return {"error": "Corridor " + corridor_id + " not found"}
+        rids = self._get_corridor_attr(cd, "road_ids", [])
+        total = self._get_corridor_attr(cd, "total_length", 0)
+        seg_l = self._get_corridor_attr(cd, "segment_lengths", [])
+        seg_o = self._get_corridor_attr(cd, "segment_offsets", [])
+        desc = self._get_corridor_attr(cd, "description", "")
+        cid = self._get_corridor_attr(cd, "id", "")
+        segs = []
+        for i, rid in enumerate(rids):
+            segs.append({"road_id": rid, "length_m": round(seg_l[i], 1) if i < len(seg_l) else 0, "start_m": round(seg_o[i], 1) if i < len(seg_o) else 0, "lanes": self._get_lanes_for_road(rid)})
+        actors = self._actors_on_roads(rids)
+        positions = sorted([a["distance_m"] for a in actors])
+        if positions:
+            gaps = []
+            prev = 0
+            for p in positions:
+                if p - prev > 5:
+                    gaps.append((prev, p, p - prev))
+                prev = p
+            if total - prev > 5:
+                gaps.append((prev, total, total - prev))
+            biggest = max(gaps, key=lambda g: g[2]) if gaps else (0, total, total)
+            hint = f"{total:.0f}m street, {len(actors)} actors. Largest gap: {biggest[2]:.0f}m ({biggest[0]:.0f}m to {biggest[1]:.0f}m)."
+        else:
+            hint = f"{total:.0f}m street, no actors placed yet."
+        return {"street": {"id": cid, "description": desc, "total_length_m": round(total, 1), "segments": segs}, "connected_streets": [], "actors_on_street": actors, "placement_hint": hint}
+
+    def _get_lanes_for_road(self, road_id: str) -> dict:
+        segments = self.segments_by_road.get(str(road_id), [])
+        left, right, seen = [], [], set()
+        for seg in segments:
+            lt = getattr(seg, "lane_type", "driving").lower()
+            lid = getattr(seg, "lane_id", 0)
+            if (lid, lt) in seen:
+                continue
+            seen.add((lid, lt))
+            if lid < 0:
+                right.append(lt)
+            elif lid > 0:
+                left.append(lt)
+        return {"right": sorted(set(right)), "left": sorted(set(left))}
+
+    def _actors_on_roads(self, road_ids: list) -> list:
+        road_set = {str(r) for r in road_ids}
+        offset_map = {}
+        cid = self.road_to_corridor.get(str(road_ids[0])) if road_ids else None
+        if cid:
+            cd = self.corridors_by_id.get(cid)
+            if cd:
+                crids = self._get_corridor_attr(cd, "road_ids", [])
+                coffsets = self._get_corridor_attr(cd, "segment_offsets", [])
+                clengths = self._get_corridor_attr(cd, "segment_lengths", [])
+                for i, rid in enumerate(crids):
+                    offset_map[rid] = (coffsets[i] if i < len(coffsets) else 0, clengths[i] if i < len(clengths) else 0)
+        results = []
+        for actor in self.actors:
+            if not actor.spawn or not actor.spawn.road_id:
+                continue
+            rid = str(actor.spawn.road_id)
+            if rid not in road_set:
+                continue
+            off, length = offset_map.get(rid, (0, 0))
+            dist = off + (actor.spawn.s_fraction or 0) * length
+            lid = actor.spawn.lane_id
+            side = "right" if (lid is not None and lid < 0) else "left" if (lid is not None and lid > 0) else "center"
+            results.append({"id": actor.id, "label": actor.label, "distance_m": round(dist, 1), "lane": side})
+        return results
+
     def scene_overview(self) -> dict[str, Any]:
         return {
             "map_name": self.map_name,
@@ -200,7 +408,19 @@ class SceneEditorState:
                 }
                 for road in self.selected_roads
             ],
-            "actors": [self._actor_summary(actor) for actor in self.actors],
+            "actors": [
+                {
+                    "id": actor.id,
+                    "label": actor.label,
+                    "kind": actor.kind,
+                    "role": actor.role,
+                    "road_id": actor.spawn.road_id if actor.spawn else None,
+                    "s_fraction": actor.spawn.s_fraction if actor.spawn else None,
+                    "is_static": actor.is_static,
+                    "speed_kph": actor.speed_kph,
+                }
+                for actor in self.actors
+            ],
             "live_actor_count": len(self.live_actors_by_label),
             "runtime_road_segment_count": len(self.runtime_map.road_segments),
             "dataset_augmented": bool(getattr(self.runtime_map, "dataset_augmented", False)),
@@ -218,7 +438,12 @@ class SceneEditorState:
             key=lambda item: (item.section_id, item.lane_id),
         )
         if summary is None and not segments:
-            raise RuntimeError(f"Road {road_key} is not available in the runtime map.")
+            return {
+                "road_id": road_key,
+                "summary": None,
+                "segments": [],
+                "note": "This road has no CARLA runtime lanes. Actors placed here will not spawn.",
+            }
         return {
             "road_id": road_key,
             "summary": summary.model_dump() if summary is not None else None,
@@ -246,9 +471,16 @@ class SceneEditorState:
             )
         )
         if segment is None:
-            raise RuntimeError(
-                f"Road {road_id} section {section_id} lane {lane_id} is not available in the runtime map."
-            )
+            return {
+                "road_id": str(road_id),
+                "section_id": section_id,
+                "lane_id": lane_id,
+                "left_lane_id": None,
+                "right_lane_id": None,
+                "left_lane": None,
+                "right_lane": None,
+                "note": "No runtime lane data available. Actor placement may still work.",
+            }
         left_lane_id, right_lane_id = self._adjacent_lane_ids(segment)
         return {
             "road_id": str(segment.road_id),
@@ -287,7 +519,7 @@ class SceneEditorState:
                         "s_fraction": max(0.0, min(1.0, (segment_s - first_s) / total_s)),
                     }
         if best is None:
-            raise RuntimeError("The runtime map has no lane geometry to project against.")
+            raise RuntimeError("Runtime map has no lane geometry. Use find_streets instead -- it returns suggested_spawn with road_id, section_id, lane_id, and s_fraction ready for edit_scene.")
         segment = best["segment"]
         return {
             "road_id": str(segment.road_id),
@@ -300,6 +532,7 @@ class SceneEditorState:
 
     def find_roads(self, criteria: dict[str, Any]) -> dict[str, Any]:
         limit = int(criteria.get("limit") or 12)
+        runtime_road_ids = {str(k) for k in self.segments_by_road.keys()}
         matches = dataset_search_roads(
             self.map_name,
             query=str(criteria.get("query") or ""),
@@ -314,6 +547,7 @@ class SceneEditorState:
             parking_right_min=criteria.get("parking_right_min"),
             require_parking_on_both_sides=criteria.get("require_parking_on_both_sides"),
             limit=limit,
+            runtime_road_ids=runtime_road_ids,
         )
         return {
             "map_name": self.map_name,
@@ -322,26 +556,7 @@ class SceneEditorState:
         }
 
     def search_maps_by_road(self, criteria: dict[str, Any]) -> dict[str, Any]:
-        matches = dataset_search_maps_by_road(
-            query=str(criteria.get("query") or ""),
-            tags=[str(item) for item in criteria.get("tags") or []],
-            lane_types=[str(item) for item in criteria.get("lane_types") or []],
-            is_intersection=criteria.get("is_intersection"),
-            has_parking=criteria.get("has_parking"),
-            driving_left=criteria.get("driving_left"),
-            driving_right=criteria.get("driving_right"),
-            total_driving=criteria.get("total_driving"),
-            parking_left_min=criteria.get("parking_left_min"),
-            parking_right_min=criteria.get("parking_right_min"),
-            require_parking_on_both_sides=criteria.get("require_parking_on_both_sides"),
-            map_limit=int(criteria.get("map_limit") or 8),
-            roads_per_map_limit=int(criteria.get("roads_per_map_limit") or 5),
-        )
-        return {
-            "current_map_name": self.map_name,
-            "map_match_count": len(matches),
-            "maps": matches,
-        }
+        return {"match_count": 0, "maps": [], "note": "Cross-map search is not available."}
 
     def apply_operations(self, operations: list[dict[str, Any]]) -> dict[str, Any]:
         applied: list[dict[str, Any]] = []
@@ -495,6 +710,7 @@ class SceneEditorState:
             actors=self.actors,
             selected_roads=self.selected_roads,
             selected_actor_id=self.selected_actor_id,
+            switch_to_scenario_id=self.switch_to_scenario_id,
             tool_trace=trace,
             raw_response=raw_response,
         )
@@ -1012,18 +1228,39 @@ class SceneEditorState:
             self.selected_actor_id = self.actors[0].id if self.actors else None
 
 
+
+
 class BedrockSceneAssistant:
     def __init__(self, carla_metadata: Any | None = None) -> None:
-        region = os.environ.get("AWS_BEDROCK_REGION") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
-        bedrock_kwargs: dict[str, Any] = {"region_name": region}
-        bedrock_key = os.environ.get("AWS_BEDROCK_ACCESS_KEY_ID")
-        bedrock_secret = os.environ.get("AWS_BEDROCK_SECRET_ACCESS_KEY")
-        if bedrock_key and bedrock_secret:
-            bedrock_kwargs["aws_access_key_id"] = bedrock_key
-            bedrock_kwargs["aws_secret_access_key"] = bedrock_secret
-        self.client = boto3.client("bedrock-runtime", **bedrock_kwargs)
-        self.model_id = ""
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        self.client = anthropic.Anthropic(api_key=api_key)
+        self.model_id = "claude-sonnet-4-6"
         self.carla_metadata = carla_metadata
+
+    def _editor_request(self, state: SceneEditorState, method: str, path: str, body: dict | None = None) -> dict:
+        """Make HTTP request back to the editor API."""
+        import requests as http_requests
+        if not state.callback_url:
+            raise RuntimeError("callback_url is not set — dataset tools are unavailable without editor callback.")
+        url = f"{state.callback_url}{path}"
+        headers = {
+            "Cookie": f"{"__Secure-" if state.callback_url and state.callback_url.startswith("https") else ""}better-auth.session_token={state.callback_auth}",
+            "Content-Type": "application/json",
+        }
+        if method == "GET":
+            r = http_requests.get(url, headers=headers, timeout=15)
+        elif method == "POST":
+            r = http_requests.post(url, headers=headers, json=body or {}, timeout=15)
+        elif method == "PUT":
+            r = http_requests.put(url, headers=headers, json=body or {}, timeout=15)
+        elif method == "PATCH":
+            r = http_requests.patch(url, headers=headers, json=body or {}, timeout=15)
+        elif method == "DELETE":
+            r = http_requests.delete(url, headers=headers, timeout=15)
+        else:
+            raise RuntimeError(f"Unsupported HTTP method: {method}")
+        r.raise_for_status()
+        return r.json() if r.content else {}
 
     def _system_prompt(self) -> str:
         return dedent(
@@ -1031,33 +1268,120 @@ class BedrockSceneAssistant:
             You are a scene editing copilot for a CARLA scenario authoring UI.
             The user wants concrete scene changes, not high-level advice.
 
+            Workflow for placing actors:
+            1. Check the scene capsule for available streets (corridors). Each corridor chains connected road segments into one logical street.
+            2. Use inspect_street(ref) to see lane details, existing actors, and placement hints for any street.
+            3. Call edit_scene with ALL changes in a single call. Use abstract placement: {street: "corridor-id", distance_m: N, lane: "right driving"}.
+            4. Reply with a short summary of what was placed.
+            Aim for 2-3 tool calls total. The corridor system handles multi-road placement automatically.
+
+            Available tools (6 total):
+            - inspect_street: full context for any street/actor/corridor
+            - find_streets: search by tags, parking, lane types
+            - inspect_actor: actor detail (position, timeline)
+            - edit_scene: all mutations (actors, weather, traffic lights)
+            - manage_scenario: list/read/create/duplicate/rename/delete/switch scenarios
+            - run_simulation: execute with optional weather + traffic light config
+
             Rules:
-            - Inspect before you modify when the request depends on current actor positions, lanes, or road structure.
-            - Use find_roads and search_maps_by_road when the user asks for a road type or map that matches certain characteristics.
-            - Use switch_map only when changing the active CARLA world is necessary to satisfy the request.
+            - find_streets returns sections with driving_lanes and parking_lanes arrays plus a suggested_spawn. Use these directly.
+            - Only call get_road if you need specific lane details not available from find_streets.
             - Only use road ids, section ids, and lane ids returned by the tools.
-            - Apply edits through the mutation tool; do not describe a change as complete unless the mutation tool succeeded.
-            - Prefer small, safe edits when the request is underspecified.
-            - When a scenario is running, use live actor state when discussing current position. Otherwise use authored positions.
+            - Apply edits through edit_scene; do not describe a change as complete unless it succeeded.
+            - Batch all actor placements into ONE edit_scene call with multiple operations.
+            - Use switch_map only when changing the active CARLA world is necessary.
             - Default vehicle blueprint: vehicle.tesla.model3
             - Default walker blueprint: walker.pedestrian.0001
-            - When adding many similar actors on one road, prefer one add_actor_row edit instead of many add_actor edits.
-            - When the user asks for an ego vehicle, set role=ego in the initial add_actor operation. Do not rely on a later update to convert a traffic actor into ego.
-            - Parked vehicles must be authored as static in the initial operation: is_static=true, speed_kph=0, autopilot=false, no lane changes.
-            - For vehicles placed in parking lanes, prefer static parked cars unless the user explicitly asks for movement.
-            - Do not stack multiple actors at the same s_fraction unless the user explicitly asks for overlap.
-            - When using add_actor_row, set s_start and s_end so repeated actors are distributed along the road.
-            - If the user asks for cars on both sides of a road, inspect the road first and use the parking lane ids returned by the tools.
-            - For road vehicles, timeline clips can use Route follow, Traffic Manager, chase_actor, ram_actor, and next-intersection turn instructions.
-            - Route-follow vehicles may also set lane_facing=against_lane for wrong-way spawn orientation and route_direction=reverse to back along the route.
-            - Use ram_actor when the user wants an intentional collision; autopilot alone will not do that reliably.
-            - Use turn_left_at_next_intersection or turn_right_at_next_intersection when the user wants a road vehicle to take a junction turn under Traffic Manager.
-            - Keep the final reply short and state exactly what changed or what blocked the change.
+            - When the user asks for an ego vehicle, set role=ego in the initial add_actor operation.
+            - Parked vehicles: is_static=true, speed_kph=0, autopilot=false.
+            - Space actors by distance along the street. Use get_street_context to see existing actors and find gaps.
+            - When adding many similar actors on one road, prefer add_actor_row over many add_actor edits.
+            - Route-follow vehicles may set lane_facing=against_lane for wrong-way or route_direction=reverse for backing.
+            - Use ram_actor for intentional collisions; autopilot alone will not do that reliably.
+            - Use turn_left/right_at_next_intersection for junction turns under Traffic Manager.
+            - Keep the final reply short and state exactly what changed.
+
+            Timeline actions for vehicles:
+            - follow_route, set_speed, stop, hold_position, enable_autopilot, disable_autopilot
+            - lane_change_left, lane_change_right, turn_left/right_at_next_intersection
+            - chase_actor, ram_actor (target_actor_id required)
+            - drive_reverse: applies CARLA vehicle.apply_control(reverse=True). This is physical reverse gear, NOT route_direction='reverse' which is route-follow backward along a path.
+            - creep_forward: slow cautious movement at 1-10 kph (target_speed_kph clamped to 10 max)
+            - yield_to_actor: wait for target actor to pass then proceed (target_actor_id + following_distance_m)
+            - swerve: sudden lateral movement (swerve_direction=left/right, swerve_magnitude=0.5-3.0m)
+
+            Weather and environment tools:
+            - set_weather: control cloudiness, precipitation, fog, wind, sun angle
+            - get_street_furniture: query traffic lights with positions and stop waypoints
+            - set_traffic_light_state: freeze and set a traffic light to red/yellow/green
+            - road_position_to_world: convert (road_id, s_fraction, lane_id) to (x, y, yaw)
+
+            Dataset and scenario management tools:
+            - list_dataset_scenarios: list all scenarios in the current dataset
+            - read_scenario: read full draft of a scenario (actors, roads, map, duration)
+            - create_scenario: create a new empty scenario in the dataset
+            - duplicate_scenario: copy an existing scenario (actors, roads, settings) into a new one
+            - rename_scenario: change a scenario's display name
+            - delete_scenario: permanently remove a scenario from the dataset
+            - switch_active_scenario: switch the editor to view/edit a different scenario
+            - run_simulation: run the current scenario as a CARLA simulation
+
+            When working with datasets:
+            - Use list_dataset_scenarios first to see what exists before making changes.
+            - Use read_scenario to inspect a scenario before duplicating or modifying it.
+            - After creating or duplicating a scenario, use switch_active_scenario so the user can see it.
+            - When asked to create variations, duplicate the source scenario and modify the copy.
             """
         ).strip()
 
     def _scene_capsule(self, request: SceneAssistantRequest) -> str:
         selected_actor_line = request.selected_actor_id or "none"
+        # Fetch map context from Aurora DB (enriched data)
+        map_context_lines = ""
+        try:
+            from ..map_context import get_map_context as _get_map_ctx
+            ctx = _get_map_ctx(request.map_name)
+            if ctx:
+                desc = ctx.get("description", "")
+                place = ctx.get("place_context", {})
+                city = place.get("city", "")
+                state = place.get("state", "")
+                if desc:
+                    map_context_lines += "\n- location: " + desc[:150]
+                if city:
+                    map_context_lines += "\n- area: " + city + (", " + state if state else "")
+                enrichment = ctx.get("enrichment", {})
+                features = enrichment.get("feature_counts", {})
+                if features:
+                    feat_parts = [f"{v} {k}" for k, v in features.items() if v]
+                    if feat_parts:
+                        map_context_lines += "\n- nearby: " + ", ".join(feat_parts)
+                tags = ctx.get("tags", [])
+                if tags:
+                    map_context_lines += "\n- features: " + ", ".join(tags[:8])
+                candidates = ctx.get("candidate_locations", [])
+                if candidates:
+                    map_context_lines += "\n- scenario locations:"
+                    for cl in candidates[:5]:
+                        label = cl.get("label", "")
+                        kind = cl.get("kind", "")
+                        if label:
+                            map_context_lines += "\n    " + label + " (" + kind + ")"
+        except Exception:
+            pass  # Map context is optional enrichment
+
+        corridor_lines = ""
+        if hasattr(self, '_cached_corridors') and self._cached_corridors:
+            corridors = self._cached_corridors
+            multi = [cd for cd in corridors if (len(cd.road_ids) if hasattr(cd, 'road_ids') else cd.get('road_count', 1)) > 1]
+            corridor_lines = "\n- streets: " + str(len(corridors)) + " (" + str(len(multi)) + " multi-segment)"
+            sorted_c = sorted(corridors, key=lambda cd: -(cd.total_length if hasattr(cd, 'total_length') else cd.get('total_length', 0)))
+            for cd in sorted_c[:5]:
+                cid = cd.id if hasattr(cd, 'id') else cd.get('id', '')
+                desc = cd.description if hasattr(cd, 'description') else cd.get('description', '')
+                corridor_lines += "\n  " + cid + ": " + desc
+            if len(corridors) > 5:
+                corridor_lines += "\n  ...and " + str(len(corridors) - 5) + " more. Use get_corridors for full list."
         return dedent(
             f"""
             Scene capsule:
@@ -1065,14 +1389,29 @@ class BedrockSceneAssistant:
             - selected roads: {len(request.selected_roads)}
             - actors: {len(request.actors)}
             - live actors: {len(request.live_actors)}
-            - selected actor id: {selected_actor_line}
+            - selected actor id: {selected_actor_line}{map_context_lines}{corridor_lines}
 
-            Use tools to inspect the scene and apply edits.
+            Place actors with: {{street: "corridor-id", distance_m: N, lane: "right driving"}}
+            Use inspect_street(ref) for full street details.
             """
         ).strip()
 
     def _tool_definitions(self) -> list[dict[str, Any]]:
         return [
+            {
+                "name": "get_corridors",
+                "description": "Return all road corridors (logical streets) with total length, lane config, and road IDs. Use to understand the road network topology.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "get_street_context",
+                "description": "Get full street context: corridor details, lanes per segment, connected streets, existing actors, placement hints. Pass a road_id or actor_id.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"ref": {"type": "string", "description": "A road_id or actor_id"}},
+                    "required": ["ref"],
+                },
+            },
             {
                 "name": "get_scene_overview",
                 "description": "Return a compact summary of selected roads, current actors, and authored or live positions.",
@@ -1126,11 +1465,12 @@ class BedrockSceneAssistant:
                 },
             },
             {
-                "name": "find_roads",
-                "description": "Search roads in the current map by tags, lane types, parking, and lane-count characteristics.",
+                "name": "find_streets",
+                "description": "Search roads and get placement-ready results. Each result includes lane IDs and a suggested_spawn (road_id, section_id, lane_id, s_fraction) — pass these directly to edit_scene. Do NOT call get_road afterward, the lane info is already here. Set scope='current_map' for active map, scope='all_maps' for all maps.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
+                        "scope": {"type": "string", "enum": ["current_map", "all_maps"], "default": "current_map"},
                         "query": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "lane_types": {"type": "array", "items": {"type": "string"}},
@@ -1147,28 +1487,6 @@ class BedrockSceneAssistant:
                 },
             },
             {
-                "name": "search_maps_by_road",
-                "description": "Search across all supported dataset maps for roads with specific tags, parking, and lane-count characteristics.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "tags": {"type": "array", "items": {"type": "string"}},
-                        "lane_types": {"type": "array", "items": {"type": "string"}},
-                        "is_intersection": {"type": "boolean"},
-                        "has_parking": {"type": "boolean"},
-                        "driving_left": {"type": "integer"},
-                        "driving_right": {"type": "integer"},
-                        "total_driving": {"type": "integer"},
-                        "parking_left_min": {"type": "integer"},
-                        "parking_right_min": {"type": "integer"},
-                        "require_parking_on_both_sides": {"type": "boolean"},
-                        "map_limit": {"type": "integer"},
-                        "roads_per_map_limit": {"type": "integer"},
-                    },
-                },
-            },
-            {
                 "name": "switch_map",
                 "description": "Switch the active CARLA world to another supported map and reset the authored scene to that map.",
                 "input_schema": {
@@ -1180,19 +1498,37 @@ class BedrockSceneAssistant:
                 },
             },
             {
-                "name": "apply_scene_edits",
-                "description": (
-                    "Apply validated scene edits. Supported operation types: "
-                    "add_actor, add_actor_row, update_actor, remove_actor, replace_timeline, add_timeline_clip, "
-                    "remove_timeline_clip, select_actor, add_selected_roads, remove_selected_roads, set_selected_roads. "
-                    "Actor payloads may include role, is_static, speed_kph, autopilot, placement_mode, blueprint, "
-                    "spawn {road_id, section_id, lane_id, s_fraction}, route_direction, lane_facing, destination, spawn_point, destination_point, "
-                    "and timeline. Timeline clips support follow_route, set_speed, stop, hold_position, enable_autopilot, disable_autopilot, "
-                    "lane_change_left, lane_change_right, turn_left_at_next_intersection, turn_right_at_next_intersection, "
-                    "chase_actor, and ram_actor. Chase and ram clips require target_actor_id and may include target_speed_kph. "
-                    "Set role=ego in add_actor when the user asks for an ego vehicle. For parked cars, "
-                    "set is_static=true, speed_kph=0, autopilot=false in the initial add_actor or add_actor_row actor template."
-                ),
+                "name": "get_map_context",
+                "description": "Get real-world context for a CARLA map: location description, geographic tags, nearby points of interest, and candidate scenario locations.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "carla_map_name": {"type": "string", "description": "CARLA map name. Leave empty for the current map."},
+                    },
+                },
+            },
+            {
+                "name": "search_maps",
+                "description": "Search all available maps by scenario tags or keywords. Use this to find the best map for a scenario (e.g., find maps with school zones, parking, traffic lights, highways). Returns map name, CARLA map name, tags, and description for each match.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Filter by map-level tags. Maps must contain ALL specified tags. Examples: SCHOOL_ZONE_BOUNDARY, TRANSIT_BUS_STOP, TURN_UNPROTECTED_LEFT, PARKING_LANE_NEAR_INTERSECTION_OCCLUSION, INTERSECTION_SIGNALIZED, NARROW_RESIDENTIAL_STREET_WITH_PARKING, FREEWAY_HIGHWAY_MAIN_CORRIDOR, WORK_ZONE_LANE_CLOSURE_STAGING"
+                        },
+                        "query": {
+                            "type": "string",
+                            "description": "Free-text search on map name and description. Case-insensitive partial match."
+                        }
+                    }
+                }
+            },
+            
+            {
+                "name": "edit_scene",
+                "description": "Apply scene mutations. Operation types: add_actor, add_actor_row, update_actor, remove_actor, replace_timeline, add_timeline_clip, remove_timeline_clip, select_actor, add_selected_roads, remove_selected_roads, set_selected_roads.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1227,16 +1563,219 @@ class BedrockSceneAssistant:
                     "required": ["operations"],
                 },
             },
+            {
+                "name": "set_weather",
+                "description": "Set CARLA weather parameters. All params optional: cloudiness (0-100), precipitation (0-100), precipitation_deposits (0-100), wind_intensity (0-100), fog_density (0-100), fog_distance (0-500m), sun_altitude_angle (-90 to 90), sun_azimuth_angle (0-360).",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cloudiness": {"type": "number", "minimum": 0, "maximum": 100},
+                        "precipitation": {"type": "number", "minimum": 0, "maximum": 100},
+                        "precipitation_deposits": {"type": "number", "minimum": 0, "maximum": 100},
+                        "wind_intensity": {"type": "number", "minimum": 0, "maximum": 100},
+                        "fog_density": {"type": "number", "minimum": 0, "maximum": 100},
+                        "fog_distance": {"type": "number", "minimum": 0, "maximum": 500},
+                        "sun_altitude_angle": {"type": "number", "minimum": -90, "maximum": 90},
+                        "sun_azimuth_angle": {"type": "number", "minimum": 0, "maximum": 360},
+                    },
+                },
+            },
+            {
+                "name": "get_street_furniture",
+                "description": "Query CARLA traffic lights and poles. Returns traffic_light_id, type, position, stop_waypoints for each traffic light.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "set_traffic_light_state",
+                "description": "Set a traffic light to a specific state. Freezes all traffic lights first, then sets the target. Use get_street_furniture first to find traffic_light_id values.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "traffic_light_id": {"type": "integer", "description": "CARLA actor id of the traffic light"},
+                        "state": {"type": "string", "enum": ["red", "yellow", "green"]},
+                        "duration_seconds": {"type": "number", "minimum": 0, "maximum": 300},
+                    },
+                    "required": ["traffic_light_id", "state"],
+                },
+            },
+            {
+                "name": "road_position_to_world",
+                "description": "Convert an OpenDRIVE road position (road_id, s_fraction, lane_id) to world coordinates (x, y, yaw).",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "road_id": {"type": "integer"},
+                        "s_fraction": {"type": "number", "minimum": 0, "maximum": 1},
+                        "lane_id": {"type": "integer"},
+                    },
+                    "required": ["road_id", "s_fraction", "lane_id"],
+                },
+            },
+            {
+                "name": "list_dataset_scenarios",
+                "description": "List all scenarios in the current dataset with id, display_name, actor_count, and map_name.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "read_scenario",
+                "description": "Read the full draft of a scenario including actors, selected_roads, map_name, and duration.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "scenario_id": {"type": "string", "description": "The scenario ID to read"},
+                    },
+                    "required": ["scenario_id"],
+                },
+            },
+            {
+                "name": "create_scenario",
+                "description": "Create a new empty scenario in the current dataset.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "display_name": {"type": "string", "description": "Name for the new scenario"},
+                        "map_name": {"type": "string", "description": "CARLA map name (defaults to current map if omitted)"},
+                    },
+                    "required": ["display_name"],
+                },
+            },
+            {
+                "name": "duplicate_scenario",
+                "description": "Duplicate an existing scenario: copies all actors, roads, and settings into a new scenario.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "source_scenario_id": {"type": "string", "description": "ID of the scenario to copy"},
+                        "new_name": {"type": "string", "description": "Display name for the new copy"},
+                    },
+                    "required": ["source_scenario_id", "new_name"],
+                },
+            },
+            {
+                "name": "rename_scenario",
+                "description": "Change the display name of an existing scenario.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "scenario_id": {"type": "string"},
+                        "new_name": {"type": "string"},
+                    },
+                    "required": ["scenario_id", "new_name"],
+                },
+            },
+            {
+                "name": "delete_scenario",
+                "description": "Permanently delete a scenario from the dataset.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "scenario_id": {"type": "string"},
+                    },
+                    "required": ["scenario_id"],
+                },
+            },
+            {
+                "name": "switch_active_scenario",
+                "description": "Switch the editor to view and edit a different scenario. Does not make an HTTP call — the editor client handles the switch.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "scenario_id": {"type": "string", "description": "ID of the scenario to switch to"},
+                        "reason": {"type": "string", "description": "Why the switch is happening"},
+                    },
+                    "required": ["scenario_id"],
+                },
+            },
+            {
+                "name": "run_simulation",
+                "description": "Run the current scenario as a CARLA simulation on the GPU orchestrator.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "duration_seconds": {"type": "number", "default": 10, "description": "Simulation duration in seconds"},
+                    },
+                },
+            },
         ]
 
     def _invoke(self, model_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.client.invoke_model(
-            modelId=model_id,
-            body=json.dumps(payload),
-            contentType="application/json",
-            accept="application/json",
+        # Wrap system prompt with cache_control for prompt caching
+        system_content = payload.get("system", "")
+        if isinstance(system_content, str):
+            system_content = [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
+
+        response = self.client.messages.create(
+            model=model_id,
+            max_tokens=payload.get("max_tokens", 32000),
+            temperature=payload.get("temperature", 1),
+            system=system_content,
+            tools=payload.get("tools", []),
+            messages=payload.get("messages", []),
+            thinking={"type": "disabled"},
         )
-        return json.loads(response["body"].read())
+        return {
+            "content": [block.model_dump() for block in response.content],
+            "stop_reason": response.stop_reason,
+            "model": response.model,
+            "usage": {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
+                "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
+            },
+        }
+
+
+    def _invoke_stream(self, model_id: str, payload: dict[str, Any]):
+        """Streaming version of _invoke. Yields (event_type, data) tuples. Retries on transient errors."""
+        import time as _time
+
+        system_content = payload.get("system", "")
+        if isinstance(system_content, str):
+            system_content = [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with self.client.messages.stream(
+                    model=model_id,
+                    max_tokens=payload.get("max_tokens", 32000),
+                    temperature=payload.get("temperature", 1),
+                    system=system_content,
+                    tools=payload.get("tools", []),
+                    messages=payload.get("messages", []),
+                    thinking={"type": "disabled"},
+                ) as stream:
+                    for event in stream:
+                        if event.type == "content_block_delta":
+                            delta = event.delta
+                            if delta.type == "thinking_delta":
+                                yield ("thinking", delta.thinking)
+                            elif delta.type == "text_delta":
+                                yield ("text", delta.text)
+
+                    response = stream.get_final_message()
+                    yield ("done", {
+                        "content": [block.model_dump() for block in response.content],
+                        "stop_reason": response.stop_reason,
+                        "model": response.model,
+                        "usage": {
+                            "input_tokens": response.usage.input_tokens,
+                            "output_tokens": response.usage.output_tokens,
+                            "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
+                            "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
+                        },
+                    })
+                    return  # Success
+            except Exception as e:
+                error_str = str(e).lower()
+                is_transient = "overloaded" in error_str or "rate" in error_str or "529" in error_str or "503" in error_str
+                if is_transient and attempt < max_retries - 1:
+                    wait = (attempt + 1) * 5
+                    print(f"[_invoke_stream] Transient error (attempt {attempt + 1}/{max_retries}), retrying in {wait}s: {e}")
+                    _time.sleep(wait)
+                    continue
+                raise
 
     def _tool_result_content(self, result: dict[str, Any]) -> list[dict[str, str]]:
         return [{"type": "text", "text": json.dumps(result, ensure_ascii=True)}]
@@ -1245,7 +1784,122 @@ class BedrockSceneAssistant:
         parts = [str(part.get("text", "")).strip() for part in content if part.get("type") == "text"]
         return "\n".join(part for part in parts if part).strip()
 
+
+    def _sanitize_content_for_api(self, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip extra fields from content blocks that the API rejects (parsed_output, citations, signature)."""
+        allowed_keys = {
+            "thinking": {"type", "thinking", "signature"},
+            "text": {"type", "text"},
+            "tool_use": {"type", "id", "name", "input"},
+            "tool_result": {"type", "tool_use_id", "content", "is_error"},
+        }
+        sanitized = []
+        for block in content:
+            block_type = block.get("type", "")
+            keys = allowed_keys.get(block_type)
+            if keys:
+                sanitized.append({k: v for k, v in block.items() if k in keys})
+            else:
+                sanitized.append(block)
+        return sanitized
+
     def _run_tool(self, state: SceneEditorState, name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+        # === Consolidated 6-tool handler ===
+        if name == "inspect_street":
+            return state.get_street_context(str(tool_input.get("ref") or ""))
+        if name == "find_streets":
+            return state.find_roads(tool_input)
+        if name == "inspect_actor":
+            return state.actor_details(str(tool_input.get("ref") or ""))
+        if name == "edit_scene":
+            ops = [dict(item) for item in tool_input.get("operations") or []]
+            # Resolve abstract placements (street + distance_m + lane) to concrete anchors
+            for op in ops:
+                actor = op.get("actor", {})
+                placement = actor.get("placement") or op.get("placement")
+                if placement and "street" in placement:
+                    try:
+                        from ..road_corridors import resolve_corridor_distance, parse_lane_spec
+                        corridor_id = str(placement["street"])
+                        distance_m = float(placement.get("distance_m", 0))
+                        lane_spec = str(placement.get("lane", "right driving"))
+                        # Resolve corridor distance to road_id + s_fraction
+                        corridor = state.corridors_by_id.get(corridor_id)
+                        if corridor:
+                            road_id, s_fraction = resolve_corridor_distance(corridor, distance_m)
+                            # Resolve lane spec to lane_id
+                            side, lane_type = parse_lane_spec(lane_spec)
+                            segments = state.segments_by_road.get(str(road_id), [])
+                            lane_id = None
+                            for seg in segments:
+                                seg_type = getattr(seg, "lane_type", "").lower()
+                                seg_lid = getattr(seg, "lane_id", 0)
+                                if seg_type == lane_type:
+                                    if (side == "right" and seg_lid < 0) or (side == "left" and seg_lid > 0):
+                                        lane_id = seg_lid
+                                        break
+                            # If no exact match, pick first driving lane on the right side
+                            if lane_id is None:
+                                for seg in segments:
+                                    seg_lid = getattr(seg, "lane_id", 0)
+                                    if side == "right" and seg_lid < 0:
+                                        lane_id = seg_lid
+                                        break
+                                    elif side == "left" and seg_lid > 0:
+                                        lane_id = seg_lid
+                                        break
+                            # Check if this is a parking placement — use world coordinates
+                            if lane_type == "parking":
+                                # Compute synthetic parking lane_id (editor convention)
+                                # Right parking: -(drivingRight + index), Left parking: (drivingLeft + index)
+                                road_sections = []
+                                for rd in state.runtime_map.road_summaries:
+                                    if str(getattr(rd, "id", "")) == str(road_id):
+                                        road_sections = getattr(rd, "section_summaries", [])
+                                        break
+                                driving_count = 0
+                                if road_sections:
+                                    sec = road_sections[0]
+                                    if side == "right":
+                                        driving_count = getattr(sec, "driving_right", 1)
+                                    else:
+                                        driving_count = getattr(sec, "driving_left", 1)
+                                if driving_count == 0:
+                                    driving_count = 1
+                                parking_lane_id = -(driving_count + 1) if side == "right" else (driving_count + 1)
+                                # Set road anchor with synthetic parking lane_id
+                                if "spawn" not in actor:
+                                    actor["spawn"] = {}
+                                actor["spawn"]["road_id"] = str(road_id)
+                                actor["spawn"]["s_fraction"] = s_fraction
+                                actor["spawn"]["lane_id"] = parking_lane_id
+                                actor["placement_mode"] = "road"
+                                actor["is_static"] = True
+                                actor["speed_kph"] = 0
+                                actor["autopilot"] = False
+                                op["actor"] = actor
+                                continue
+                            # Set the resolved spawn on the actor (driving lane path)
+                            if "spawn" not in actor:
+                                actor["spawn"] = {}
+                            actor["spawn"]["road_id"] = str(road_id)
+                            actor["spawn"]["s_fraction"] = s_fraction
+                            if lane_id is not None:
+                                actor["spawn"]["lane_id"] = lane_id
+                            op["actor"] = actor
+                    except Exception as exc:
+                        import logging
+                        logging.getLogger(__name__).warning("Abstract placement resolution failed: %s", exc)
+            return state.apply_operations(ops)
+        if name == "manage_scenario":
+            return self._handle_manage_scenario(state, tool_input)
+        if name == "run_simulation":
+            return self._handle_run_simulation(state, tool_input)
+        # Legacy tool names (backward compat during transition)
+        if name == "get_street_context":
+            return state.get_street_context(str(tool_input.get("ref") or ""))
+        if name == "get_corridors":
+            return state.get_corridors_summary()
         if name == "get_scene_overview":
             return state.scene_overview()
         if name == "get_actor":
@@ -1253,39 +1907,165 @@ class BedrockSceneAssistant:
         if name == "get_road":
             return state.road_details(str(tool_input.get("road_id") or ""))
         if name == "get_adjacent_lanes":
-            return state.adjacent_lanes(
-                str(tool_input.get("road_id") or ""),
-                int(tool_input.get("section_id")),
-                int(tool_input.get("lane_id")),
-            )
+            return state.adjacent_lanes(str(tool_input.get("road_id") or ""), int(tool_input.get("section_id")), int(tool_input.get("lane_id")))
         if name == "find_nearest_lane":
             return state.nearest_lane(float(tool_input.get("x")), float(tool_input.get("y")))
-        if name == "find_roads":
+        if name == "find_streets":
+            scope = str(tool_input.pop("scope", "current_map"))
+            if scope == "all_maps":
+                return state.search_maps_by_road(tool_input)
             return state.find_roads(tool_input)
-        if name == "search_maps_by_road":
-            return state.search_maps_by_road(tool_input)
         if name == "switch_map":
+            return {"error": "Map switching is not available. Please switch maps from the editor UI."}
+        if name == "get_map_context":
+            from ..map_context import get_map_context as get_map_context_from_db
+            target = str(tool_input.get("carla_map_name") or "").strip() or state.map_name
+            result = get_map_context_from_db(target)
+            if result is None:
+                return {"error": f"No map asset found for CARLA map '{target}'"}
+            return result
+        if name == "edit_scene":
+            ops = [dict(item) for item in tool_input.get("operations") or []]
+            # Resolve abstract placements (street + distance_m + lane) to concrete anchors
+            for op in ops:
+                actor = op.get("actor", {})
+                placement = actor.get("placement") or op.get("placement")
+                if placement and "street" in placement:
+                    try:
+                        from ..road_corridors import resolve_corridor_distance, parse_lane_spec
+                        corridor_id = str(placement["street"])
+                        distance_m = float(placement.get("distance_m", 0))
+                        lane_spec = str(placement.get("lane", "right driving"))
+                        # Resolve corridor distance to road_id + s_fraction
+                        corridor = state.corridors_by_id.get(corridor_id)
+                        if corridor:
+                            road_id, s_fraction = resolve_corridor_distance(corridor, distance_m)
+                            # Resolve lane spec to lane_id
+                            side, lane_type = parse_lane_spec(lane_spec)
+                            segments = state.segments_by_road.get(str(road_id), [])
+                            lane_id = None
+                            for seg in segments:
+                                seg_type = getattr(seg, "lane_type", "").lower()
+                                seg_lid = getattr(seg, "lane_id", 0)
+                                if seg_type == lane_type:
+                                    if (side == "right" and seg_lid < 0) or (side == "left" and seg_lid > 0):
+                                        lane_id = seg_lid
+                                        break
+                            # If no exact match, pick first driving lane on the right side
+                            if lane_id is None:
+                                for seg in segments:
+                                    seg_lid = getattr(seg, "lane_id", 0)
+                                    if side == "right" and seg_lid < 0:
+                                        lane_id = seg_lid
+                                        break
+                                    elif side == "left" and seg_lid > 0:
+                                        lane_id = seg_lid
+                                        break
+                            # Check if this is a parking placement — use world coordinates
+                            if lane_type == "parking":
+                                # Compute synthetic parking lane_id (editor convention)
+                                # Right parking: -(drivingRight + index), Left parking: (drivingLeft + index)
+                                road_sections = []
+                                for rd in state.runtime_map.road_summaries:
+                                    if str(getattr(rd, "id", "")) == str(road_id):
+                                        road_sections = getattr(rd, "section_summaries", [])
+                                        break
+                                driving_count = 0
+                                if road_sections:
+                                    sec = road_sections[0]
+                                    if side == "right":
+                                        driving_count = getattr(sec, "driving_right", 1)
+                                    else:
+                                        driving_count = getattr(sec, "driving_left", 1)
+                                if driving_count == 0:
+                                    driving_count = 1
+                                parking_lane_id = -(driving_count + 1) if side == "right" else (driving_count + 1)
+                                # Set road anchor with synthetic parking lane_id
+                                if "spawn" not in actor:
+                                    actor["spawn"] = {}
+                                actor["spawn"]["road_id"] = str(road_id)
+                                actor["spawn"]["s_fraction"] = s_fraction
+                                actor["spawn"]["lane_id"] = parking_lane_id
+                                actor["placement_mode"] = "road"
+                                actor["is_static"] = True
+                                actor["speed_kph"] = 0
+                                actor["autopilot"] = False
+                                op["actor"] = actor
+                                continue
+                            # Set the resolved spawn on the actor (driving lane path)
+                            if "spawn" not in actor:
+                                actor["spawn"] = {}
+                            actor["spawn"]["road_id"] = str(road_id)
+                            actor["spawn"]["s_fraction"] = s_fraction
+                            if lane_id is not None:
+                                actor["spawn"]["lane_id"] = lane_id
+                            op["actor"] = actor
+                    except Exception as exc:
+                        import logging
+                        logging.getLogger(__name__).warning("Abstract placement resolution failed: %s", exc)
+            return state.apply_operations(ops)
+        if name == "set_weather":
             if self.carla_metadata is None:
-                raise RuntimeError("Map switching is unavailable because no CARLA metadata service is attached.")
-            target_map = str(tool_input.get("map_name") or "").strip()
-            if not target_map:
-                raise RuntimeError("map_name is required.")
-            status = self.carla_metadata.load_map(target_map)
-            runtime_map = self.carla_metadata.get_runtime_map()
-            state.replace_runtime_context(runtime_map.map_name, runtime_map)
-            return {
-                "status": status.model_dump() if hasattr(status, "model_dump") else status,
-                "runtime_map": {
-                    "map_name": runtime_map.map_name,
-                    "normalized_map_name": runtime_map.normalized_map_name,
-                    "road_segment_count": len(runtime_map.road_segments),
-                    "road_summary_count": len(runtime_map.road_summaries),
-                },
-                "scene_reset": True,
-            }
-        if name == "apply_scene_edits":
-            return state.apply_operations([dict(item) for item in tool_input.get("operations") or []])
-        raise RuntimeError(f"Unsupported assistant tool {name}.")
+                return {"error": "Weather control unavailable."}
+            return self.carla_metadata.set_weather(tool_input)
+        if name == "get_street_furniture":
+            if self.carla_metadata is None:
+                return {"error": "Street furniture unavailable."}
+            return self.carla_metadata.get_street_furniture()
+        if name == "set_traffic_light_state":
+            if self.carla_metadata is None:
+                return {"error": "Traffic light control unavailable."}
+            return self.carla_metadata.set_traffic_light_state(tool_input)
+        if name == "road_position_to_world":
+            if self.carla_metadata is None:
+                return {"error": "Position conversion unavailable."}
+            return self.carla_metadata.road_position_to_world(tool_input)
+        # Dataset tools -> manage_scenario
+        dataset_actions = {"list_dataset_scenarios": "list", "read_scenario": "read", "create_scenario": "create", "duplicate_scenario": "duplicate", "rename_scenario": "rename", "delete_scenario": "delete", "switch_active_scenario": "switch"}
+        if name in dataset_actions:
+            tool_input["action"] = dataset_actions[name]
+            return self._handle_manage_scenario(state, tool_input)
+        if name == "run_simulation":
+            return self._handle_run_simulation(state, tool_input)
+        raise RuntimeError(f"Unsupported tool: {name}")
+
+    def _handle_manage_scenario(self, state: SceneEditorState, tool_input: dict[str, Any]) -> dict[str, Any]:
+        if not state.callback_url:
+            return {"error": "Scenario management requires the editor connection. This feature is not available in standalone mode."}
+        action = str(tool_input.get("action", ""))
+        if action == "list":
+            return self._editor_request(state, "GET", "/api/datasets/" + str(getattr(state, "dataset_id", "") or "") + "/scenarios")
+        if action == "read":
+            sid = tool_input.get("scenario_id", "")
+            return self._editor_request(state, "GET", "/api/scenarios/" + str(sid))
+        if action == "create":
+            return self._editor_request(state, "POST", "/api/datasets/" + str(getattr(state, "dataset_id", "") or "") + "/scenarios", {"name": tool_input.get("name", "New Scenario")})
+        if action == "duplicate":
+            return self._editor_request(state, "POST", "/api/scenarios/" + str(tool_input.get("source_scenario_id", "")) + "/duplicate", {"name": tool_input.get("name", "")})
+        if action == "rename":
+            return self._editor_request(state, "PATCH", "/api/scenarios/" + str(tool_input.get("scenario_id", "")), {"display_name": tool_input.get("name", "")})
+        if action == "delete":
+            return self._editor_request(state, "DELETE", "/api/scenarios/" + str(tool_input.get("scenario_id", "")))
+        if action == "switch":
+            return {"switch_to_scenario_id": tool_input.get("scenario_id", ""), "note": "Editor will switch to this scenario."}
+        return {"error": f"Unknown action: {action}. Use: list, read, create, duplicate, rename, delete, switch"}
+
+    def _handle_run_simulation(self, state: SceneEditorState, tool_input: dict[str, Any]) -> dict[str, Any]:
+        # Apply weather if specified
+        weather = tool_input.get("weather")
+        if weather and self.carla_metadata:
+            if isinstance(weather, str):
+                self.carla_metadata.set_weather({"preset": weather})
+            elif isinstance(weather, dict):
+                self.carla_metadata.set_weather(weather)
+        # Apply traffic light overrides
+        tl = tool_input.get("traffic_lights")
+        if tl and self.carla_metadata:
+            for tl_config in tl:
+                self.carla_metadata.set_traffic_light_state(tl_config)
+        # Run simulation via editor callback
+        return {"status": "simulation_requested", "weather_applied": weather is not None, "traffic_lights_set": tl is not None, "record": tool_input.get("record", True)}
+
 
     def _langchain_tools(self, state: SceneEditorState, trace: list[SceneAssistantToolTrace]) -> dict[str, Any]:
         if not LANGCHAIN_AVAILABLE:
@@ -1307,53 +2087,34 @@ class BedrockSceneAssistant:
 
         tools = [
             make_tool(
-                "get_scene_overview",
-                "Return a compact summary of selected roads, current actors, and authored or live positions.",
-                SceneAssistantGetSceneOverviewInput,
+                "inspect_street",
+                "Get full context for a street: corridor details, available lanes per segment, connected streets at intersections, existing actors, and placement hints. Pass a road_id, actor_id, or corridor_id.",
+                InspectStreetInput,
             ),
             make_tool(
-                "get_actor",
-                "Return detailed information about a specific actor by id or label.",
-                SceneAssistantGetActorInput,
+                "find_streets",
+                "Search for streets by tags, parking, lane types, and lane-count characteristics. Returns matching streets with corridor context.",
+                FindStreetsInput,
             ),
             make_tool(
-                "get_road",
-                "Return road summary and runtime lane segment details for a road id.",
-                SceneAssistantGetRoadInput,
+                "inspect_actor",
+                "Return detailed information about a specific actor by id or label, including position, timeline, and properties.",
+                InspectActorInput,
             ),
             make_tool(
-                "get_adjacent_lanes",
-                "Return left and right drivable lane information for a specific road, section, and lane.",
-                SceneAssistantGetAdjacentLanesInput,
+                "edit_scene",
+                "Apply scene mutations. Operation types: add_actor, add_actor_row, update_actor, remove_actor, replace_timeline, add_timeline_clip, remove_timeline_clip, select_actor, add_selected_roads, remove_selected_roads, set_selected_roads, set_weather, set_traffic_light. Use placement format: {street: corridor_id, distance_m: N, lane: 'right driving'} for actor placement.",
+                EditSceneInput,
             ),
             make_tool(
-                "find_nearest_lane",
-                "Project an XY point in frontend map coordinates to the nearest runtime lane.",
-                SceneAssistantFindNearestLaneInput,
+                "manage_scenario",
+                "Manage scenarios in the current dataset. Actions: list (list all), read (read full draft), create (new empty), duplicate (copy existing), rename (change name), delete (remove), switch (change active scenario). Pass action + relevant params.",
+                ManageScenarioInput,
             ),
             make_tool(
-                "find_roads",
-                "Search roads in the current map by tags, parking, and lane-count characteristics.",
-                SceneAssistantFindRoadsInput,
-            ),
-            make_tool(
-                "search_maps_by_road",
-                "Search across all supported dataset maps for roads with specific tags, parking, and lane-count characteristics.",
-                SceneAssistantSearchMapsByRoadInput,
-            ),
-            make_tool(
-                "switch_map",
-                "Switch the active CARLA world to another supported map and reset the authored scene to that map.",
-                SceneAssistantSwitchMapInput,
-            ),
-            make_tool(
-                "apply_scene_edits",
-                (
-                    "Apply validated scene edits. Supported operation types: add_actor, add_actor_row, "
-                    "update_actor, remove_actor, replace_timeline, add_timeline_clip, remove_timeline_clip, "
-                    "select_actor, add_selected_roads, remove_selected_roads, set_selected_roads."
-                ),
-                SceneAssistantApplyEditsInput,
+                "run_simulation",
+                "Run the current scenario as a CARLA simulation. Optionally set weather (preset name or params), traffic light states, and duration. Records by default.",
+                RunSimulationInput,
             ),
         ]
         return {tool.name: tool for tool in tools}
@@ -1388,12 +2149,38 @@ class BedrockSceneAssistant:
     def _chat_langchain(self, model_id: str, request: SceneAssistantRequest) -> SceneAssistantResponse:
         trace: list[SceneAssistantToolTrace] = []
         state = SceneEditorState(request)
+        # Inject corridor data from carla_metadata cache
+        if self.carla_metadata is not None:
+            try:
+                with self.carla_metadata._lock:
+                    cached_corridors = self.carla_metadata._corridor_cache.get(request.map_name) or self.carla_metadata._corridor_cache.get(getattr(self.carla_metadata, "_current_map_name", ""))
+                if cached_corridors:
+                    state.set_corridors(cached_corridors)
+                    self._cached_corridors = cached_corridors
+                # Also populate runtime segments from carla_metadata if editor sent empty
+                if not state.runtime_map.road_segments:
+                    try:
+                        rt = self.carla_metadata.get_runtime_map(force_refresh=False)
+                        state.runtime_map = rt
+                        state._rebuild_runtime_indexes()
+                        import logging
+                        logging.getLogger(__name__).info("Populated %d runtime segments from carla_metadata", len(rt.road_segments))
+                    except Exception as _exc:
+                        import logging
+                        logging.getLogger(__name__).warning("Failed to populate runtime segments: %s", _exc)
+            except Exception:
+                pass  # Corridors are optional
         messages = self._langchain_message_history(request)
         tool_map = self._langchain_tools(state, trace)
-        model = create_chat_model(model_id, temperature=0.2, max_tokens=1400).bind_tools(list(tool_map.values()))
+        model = create_chat_model(
+            model_id,
+            temperature=1,
+            max_tokens=32000,
+            thinking={"type": "disabled"},
+        ).bind_tools(list(tool_map.values()))
         raw_response: dict[str, Any] = {}
 
-        for _ in range(8):
+        for _ in range(30):
             ai_message = model.invoke(
                 messages,
                 config=langsmith_run_config(
@@ -1412,7 +2199,11 @@ class BedrockSceneAssistant:
 
             tool_calls = getattr(ai_message, "tool_calls", None) or []
             if not tool_calls:
-                reply = self._langchain_text(getattr(ai_message, "content", "")) or "I inspected the scene but do not have a textual reply."
+                # Skip thinking blocks, only extract text
+                content = getattr(ai_message, "content", "")
+                if isinstance(content, list):
+                    content = [part for part in content if not (isinstance(part, dict) and part.get("type") == "thinking")]
+                reply = self._langchain_text(content) or "I inspected the scene but do not have a textual reply."
                 self.model_id = model_id
                 return state.response(model_id, reply, trace, raw_response)
 
@@ -1433,15 +2224,31 @@ class BedrockSceneAssistant:
     @traceable(run_type="chain", name="carla_scene_assistant")
     def chat(self, request: SceneAssistantRequest) -> SceneAssistantResponse:
         if LANGCHAIN_AVAILABLE:
-            errors: list[str] = []
-            for model_id in [candidate for candidate in DEFAULT_MODEL_CANDIDATES if candidate]:
-                try:
-                    return self._chat_langchain(model_id, request)
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{model_id}: {type(exc).__name__}: {exc}")
-            raise RuntimeError("Scene assistant failed. " + " | ".join(errors))
+            return self._chat_langchain(self.model_id, request)
 
         trace: list[SceneAssistantToolTrace] = []
+        state = SceneEditorState(request)
+        # Inject corridor data from carla_metadata cache
+        if self.carla_metadata is not None:
+            try:
+                with self.carla_metadata._lock:
+                    cached_corridors = self.carla_metadata._corridor_cache.get(request.map_name) or self.carla_metadata._corridor_cache.get(getattr(self.carla_metadata, "_current_map_name", ""))
+                if cached_corridors:
+                    state.set_corridors(cached_corridors)
+                    self._cached_corridors = cached_corridors
+                # Also populate runtime segments from carla_metadata if editor sent empty
+                if not state.runtime_map.road_segments:
+                    try:
+                        rt = self.carla_metadata.get_runtime_map(force_refresh=False)
+                        state.runtime_map = rt
+                        state._rebuild_runtime_indexes()
+                        import logging
+                        logging.getLogger(__name__).info("Populated %d runtime segments from carla_metadata", len(rt.road_segments))
+                    except Exception as _exc:
+                        import logging
+                        logging.getLogger(__name__).warning("Failed to populate runtime segments: %s", _exc)
+            except Exception:
+                pass  # Corridors are optional
         base_messages: list[dict[str, Any]] = [
             {
                 "role": "user",
@@ -1456,46 +2263,196 @@ class BedrockSceneAssistant:
                 }
             )
 
-        errors: list[str] = []
-        for model_id in [candidate for candidate in DEFAULT_MODEL_CANDIDATES if candidate]:
-            state = SceneEditorState(request)
-            messages = deepcopy(base_messages)
-            raw_response: dict[str, Any] = {}
+        messages = deepcopy(base_messages)
+        raw_response: dict[str, Any] = {}
+        try:
+            for _ in range(30):
+                payload = {
+                    "max_tokens": 32000,
+                    "temperature": 1,
+                    "system": self._system_prompt(),
+                    "tools": self._tool_definitions(),
+                    "messages": messages,
+                }
+                raw_response = self._invoke(self.model_id, payload)
+                content = raw_response.get("content") or []
+                messages.append({"role": "assistant", "content": self._sanitize_content_for_api(content)})
+
+                # Filter: only look at tool_use blocks for tool execution
+                tool_uses = [part for part in content if part.get("type") == "tool_use"]
+                if not tool_uses:
+                    # Get text from non-thinking blocks
+                    text_parts = [part for part in content if part.get("type") == "text"]
+                    reply = self._text_from_content(text_parts) or "I inspected the scene but do not have a textual reply."
+                    self.model_id = self.model_id
+                    return state.response(self.model_id, reply, trace, raw_response)
+
+                tool_results: list[dict[str, Any]] = []
+                for tool_use in tool_uses:
+                    name = str(tool_use.get("name") or "")
+                    tool_input = dict(tool_use.get("input") or {})
+                    result = self._run_tool(state, name, tool_input)
+                    trace.append(SceneAssistantToolTrace(name=name, input=tool_input, result=result))
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": self._tool_result_content(result),
+                        }
+                    )
+                messages.append({"role": "user", "content": tool_results})
+            raise RuntimeError("Assistant exceeded the maximum tool-use rounds.")
+        except Exception as exc:
+            raise RuntimeError(f"Scene assistant failed: {exc}") from exc
+
+    def chat_stream(self, request: SceneAssistantRequest):
+        """Generator that yields SSE-formatted events for each step of the tool-use loop.
+
+        Events:
+          - thinking: LLM reasoning / thinking blocks
+          - tool_call: tool name + input when Claude calls a tool
+          - tool_result: tool name + output after execution
+          - actor_update: current actors + roads after edit_scene
+          - complete: final response (same payload as sync endpoint)
+          - error: on any error
+        """
+        import traceback as tb
+
+        trace: list[SceneAssistantToolTrace] = []
+        state = SceneEditorState(request)
+        # Inject corridor data from carla_metadata cache
+        if self.carla_metadata is not None:
             try:
-                for _ in range(8):
-                    payload = {
-                        "anthropic_version": "bedrock-2023-05-31",
-                        "max_tokens": 1400,
-                        "temperature": 0.2,
-                        "system": self._system_prompt(),
-                        "tools": self._tool_definitions(),
-                        "messages": messages,
-                    }
-                    raw_response = self._invoke(model_id, payload)
-                    content = raw_response.get("content") or []
-                    messages.append({"role": "assistant", "content": content})
+                with self.carla_metadata._lock:
+                    cached_corridors = self.carla_metadata._corridor_cache.get(request.map_name) or self.carla_metadata._corridor_cache.get(getattr(self.carla_metadata, "_current_map_name", ""))
+                if cached_corridors:
+                    state.set_corridors(cached_corridors)
+                    self._cached_corridors = cached_corridors
+                # Also populate runtime segments from carla_metadata if editor sent empty
+                if not state.runtime_map.road_segments:
+                    try:
+                        rt = self.carla_metadata.get_runtime_map(force_refresh=False)
+                        state.runtime_map = rt
+                        state._rebuild_runtime_indexes()
+                        import logging
+                        logging.getLogger(__name__).info("Populated %d runtime segments from carla_metadata", len(rt.road_segments))
+                    except Exception as _exc:
+                        import logging
+                        logging.getLogger(__name__).warning("Failed to populate runtime segments: %s", _exc)
+            except Exception:
+                pass  # Corridors are optional
+        base_messages: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": self._scene_capsule(request)}],
+            }
+        ]
+        for message in request.messages:
+            base_messages.append(
+                {
+                    "role": message.role,
+                    "content": [{"type": "text", "text": message.content}],
+                }
+            )
 
-                    tool_uses = [part for part in content if part.get("type") == "tool_use"]
-                    if not tool_uses:
-                        reply = self._text_from_content(content) or "I inspected the scene but do not have a textual reply."
-                        self.model_id = model_id
-                        return state.response(model_id, reply, trace, raw_response)
+        messages = deepcopy(base_messages)
 
-                    tool_results: list[dict[str, Any]] = []
-                    for tool_use in tool_uses:
-                        name = str(tool_use.get("name") or "")
-                        tool_input = dict(tool_use.get("input") or {})
+        def _sse(event: str, data: Any) -> str:
+            payload = json.dumps(data, ensure_ascii=True, default=str)
+            return f"event: {event}\ndata: {payload}\n\n"
+
+        try:
+            system_content = self._system_prompt()
+            if isinstance(system_content, str):
+                system_content = [{"type": "text", "text": system_content, "cache_control": {"type": "ephemeral"}}]
+
+            for turn in range(30):
+                # Use streaming API for real-time text/thinking deltas
+                raw_response = None
+                # Retry transient API errors (overloaded, rate limit)
+                import time as _time
+                _stream_ok = False
+                for _retry in range(3):
+                    try:
+                        for evt_type, evt_data in self._invoke_stream(self.model_id, {
+                            "max_tokens": 32000,
+                            "temperature": 1,
+                            "system": system_content,
+                            "tools": self._tool_definitions(),
+                            "messages": messages,
+                        }):
+                            if evt_type == "thinking":
+                                yield _sse("thinking", {"thinking": evt_data})
+                            elif evt_type == "text":
+                                yield _sse("text", {"text": evt_data})
+                            elif evt_type == "done":
+                                raw_response = evt_data
+                        _stream_ok = True
+                        break
+                    except Exception as _retry_err:
+                        _err_str = str(_retry_err).lower()
+                        if ("overloaded" in _err_str or "529" in _err_str or "503" in _err_str) and _retry < 2:
+                            _wait = (_retry + 1) * 10
+                            print(f"[chat_stream] Transient API error (attempt {_retry+1}/3), retrying in {_wait}s")
+                            _time.sleep(_wait)
+                            continue
+                        raise
+
+                if raw_response is None:
+                    yield _sse("error", {"error": "Stream ended without final response"})
+                    return
+
+                content = raw_response.get("content") or []
+                messages.append({"role": "assistant", "content": self._sanitize_content_for_api(content)})
+
+                # Check for tool uses
+                tool_uses = [part for part in content if part.get("type") == "tool_use"]
+
+                if not tool_uses:
+                    # Final text response - no more tool calls
+                    text_parts = [part for part in content if part.get("type") == "text"]
+                    reply = self._text_from_content(text_parts) or "I inspected the scene but do not have a textual reply."
+                    response = state.response(self.model_id, reply, trace, raw_response)
+                    yield _sse("complete", response.model_dump())
+                    return
+
+                # Process each tool call
+                tool_results: list[dict[str, Any]] = []
+                for tool_use in tool_uses:
+                    name = str(tool_use.get("name") or "")
+                    tool_input = dict(tool_use.get("input") or {})
+
+                    # Emit tool_call event
+                    yield _sse("tool_call", {"name": name, "input": tool_input, "tool_use_id": tool_use["id"]})
+
+                    try:
                         result = self._run_tool(state, name, tool_input)
-                        trace.append(SceneAssistantToolTrace(name=name, input=tool_input, result=result))
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use["id"],
-                                "content": self._tool_result_content(result),
-                            }
-                        )
-                    messages.append({"role": "user", "content": tool_results})
-                raise RuntimeError("Assistant exceeded the maximum tool-use rounds.")
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{model_id}: {type(exc).__name__}: {exc}")
-        raise RuntimeError("Scene assistant failed. " + " | ".join(errors))
+                    except Exception as tool_exc:
+                        result = {"error": str(tool_exc)}
+
+                    trace.append(SceneAssistantToolTrace(name=name, input=tool_input, result=result))
+
+                    # Emit tool_result event
+                    yield _sse("tool_result", {"name": name, "result": result, "tool_use_id": tool_use["id"]})
+
+                    # Emit actor_update after edit_scene
+                    if name == "edit_scene":
+                        yield _sse("actor_update", {
+                            "actors": [actor.model_dump() for actor in state.actors],
+                            "selected_roads": [road.model_dump() for road in state.selected_roads],
+                            "selected_actor_id": state.selected_actor_id,
+                            "map_name": state.map_name,
+                        })
+
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": self._tool_result_content(result),
+                        }
+                    )
+                messages.append({"role": "user", "content": tool_results})
+
+            yield _sse("error", {"error": "Assistant exceeded the maximum tool-use rounds."})
+        except Exception as exc:
+            yield _sse("error", {"error": str(exc), "traceback": tb.format_exc()})
