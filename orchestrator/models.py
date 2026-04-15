@@ -70,6 +70,16 @@ class StoredArtifact(BaseModel):
     s3_bucket: str | None = None
     s3_key: str | None = None
     s3_uri: str | None = None
+    artifact_class: str | None = None
+    sensor_id: str | None = None
+    sensor_label: str | None = None
+    sensor_category: str | None = None
+    output_modality: str | None = None
+    artifact_format: str | None = None
+    frame_index: int | None = None
+    sequence_id: str | None = None
+    is_raw: bool | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class JobArtifacts(BaseModel):
@@ -120,6 +130,8 @@ class HealthResponse(BaseModel):
     total_slots: int
     busy_slots: int
     queued_jobs: int
+    queue_accepting: bool = False
+    capacity_available: bool = False
     carla_connected: bool = False
     metadata_connected: bool = False
     metadata_slot_index: int | None = None
@@ -129,7 +141,6 @@ class HealthResponse(BaseModel):
     langchain_available: bool = False
     langsmith_available: bool = False
     langsmith_tracing: bool = False
-
 
 
 class RuntimeLaunchSpec(BaseModel):

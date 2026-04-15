@@ -486,10 +486,10 @@ class OrchestratorService:
                 artifacts=local_artifacts,
             )
             self._send_phase(job_id, "uploading", "Uploading artifacts to S3")
-            uploaded_artifacts = self.artifact_storage.upload_job_artifacts(current)
-            # S3-first: upload everything and delete local directory
             if hasattr(self.artifact_storage, 'upload_all_and_delete_local'):
-                self.artifact_storage.upload_all_and_delete_local(current)
+                uploaded_artifacts = self.artifact_storage.upload_all_and_delete_local(current)
+            else:
+                uploaded_artifacts = self.artifact_storage.upload_job_artifacts(current)
             final_artifacts = current.artifacts
             if uploaded_artifacts:
                 final_artifacts = current.artifacts.model_copy(update={"uploaded_artifacts": uploaded_artifacts})

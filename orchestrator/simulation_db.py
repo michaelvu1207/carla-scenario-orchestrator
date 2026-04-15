@@ -145,7 +145,16 @@ def create_artifact(
             VALUES
                 (:id, :workspace_id, :scenario_legacy_id, :scenario_id, :simulation_id,
                  :kind, :label, :content_type, :file_ext, :size_bytes, :checksum_sha256,
-                 :s3_bucket, :s3_key, :created_by_user_id, :created_at::timestamptz)""",
+                 :s3_bucket, :s3_key, :created_by_user_id, :created_at::timestamptz)
+            ON CONFLICT (workspace_id, scenario_id, s3_key)
+            DO UPDATE SET
+                simulation_id = COALESCE(simulation_artifacts.simulation_id, EXCLUDED.simulation_id),
+                kind = EXCLUDED.kind,
+                label = EXCLUDED.label,
+                content_type = EXCLUDED.content_type,
+                file_ext = EXCLUDED.file_ext,
+                size_bytes = EXCLUDED.size_bytes,
+                checksum_sha256 = EXCLUDED.checksum_sha256""",
             [
                 param("id", artifact_id),
                 param("workspace_id", workspace_id),
