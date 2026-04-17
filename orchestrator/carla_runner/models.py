@@ -89,6 +89,7 @@ class ActorDraft(BaseModel):
 
 class SimulationRunRequest(BaseModel):
     scenario_id: str | None = None
+    correlation_id: str | None = None
     map_name: str
     selected_roads: list[SelectedRoad] = Field(default_factory=list)
     actors: list[ActorDraft] = Field(default_factory=list)
